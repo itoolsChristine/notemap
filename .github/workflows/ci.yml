@@ -1,0 +1,56 @@
+name: CI
+
+on: [push, pull_request]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.10', '3.12']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r src/notemap-mcp/requirements.txt
+
+      - name: Run search tests
+        run: python -m unittest tests.test_search -v
+
+      - name: Run index tests
+        run: python -m unittest tests.test_index -v
+
+      - name: Run interval tests
+        run: python -m unittest tests.test_intervals -v
+
+      - name: Run roundtrip tests
+        run: python -m unittest tests.test_roundtrip -v
+
+      - name: Run sync tests
+        run: python -m unittest tests.test_sync -v
+
+      - name: Run audit tests
+        run: python -m unittest tests.test_audit -v
+
+      - name: Run lint tests
+        run: python -m unittest tests.test_lint -v
+
+      - name: Run utils tests
+        run: python -m unittest tests.test_utils -v
+
+      - name: Run notes helpers tests
+        run: python -m unittest tests.test_notes_helpers -v
+
+      - name: Run preflight tests
+        run: python -m unittest tests.test_preflight -v
+
+      - name: Run check tests
+        run: python -m unittest tests.test_check -v
