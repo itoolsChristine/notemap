@@ -2,3 +2,7 @@ mcp>=1.20,<2.0
 python-frontmatter>=1.1.0
 python-slugify>=8.0.0
 pyyaml>=6.0
+
+# Embedding support (optional -- notemap works without these, falling back to keyword search)
+model2vec>=0.4.0
+numpy>=1.24.0

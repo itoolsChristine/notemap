@@ -20,11 +20,11 @@ $McpJson    = Join-Path $HomeDir ".claude.json"
 $SettingsJson = Join-Path $ClaudeDir "settings.json"
 $ScriptsDir = Join-Path $ClaudeDir "scripts\notemap"
 
-$McpFiles = @("server.py", "models.py", "notes.py", "search.py", "index.py", "audit.py", "lint.py", "preflight.py", "check.py", "utils.py")
+$McpFiles = @("server.py", "models.py", "notes.py", "search.py", "index.py", "db.py", "audit.py", "lint.py", "preflight.py", "check.py", "graph.py", "events.py", "utils.py", "embed.py", "chunk.py", "rag.py")
 $DocFiles = @("notemap.md")
 $SkillFiles = @("notemap-review.md")
 $CommandFiles = @("notemap.md")
-$HookFiles = @("session-start.sh", "pre-edit.sh", "post-edit.sh")
+$HookFiles = @("session-start.sh", "post-edit.sh", "user-prompt.sh")
 
 # ============================================================================
 #  Banner
@@ -285,12 +285,12 @@ function Backup-Existing {
     if (Test-Path $ClaudeMd) { Copy-Item $ClaudeMd "$script:BackupDir\CLAUDE.md" -Force }
     if (Test-Path $McpJson) { Copy-Item $McpJson "$script:BackupDir\.claude.json" -Force }
 
-    # Back up note storage (index only, not all notes -- those can be large)
-    $indexFile = Join-Path $StorageDir "_index.json"
-    if (Test-Path $indexFile) {
+    # Back up note database if it exists
+    $dbFile = Join-Path $StorageDir "notemap.db"
+    if (Test-Path $dbFile) {
         New-Item -ItemType Directory -Path "$script:BackupDir\notemap" -Force | Out-Null
-        Copy-Item $indexFile "$script:BackupDir\notemap\_index.json" -Force
-        Write-Ok "Note index backed up"
+        Copy-Item $dbFile "$script:BackupDir\notemap\notemap.db" -Force
+        Write-Ok "Note database backed up"
     }
 
     Write-Ok "Pre-install backup created: $script:BackupDir"
@@ -319,7 +319,7 @@ function Install-Files {
         Get-InstallFile "src/notemap-mcp/$f" (Join-Path $McpDir $f)
     }
     Get-InstallFile "src/notemap-mcp/requirements.txt" (Join-Path $McpDir "requirements.txt")
-    Write-Ok "MCP server installed (10 Python files + requirements.txt)"
+    Write-Ok "MCP server installed (16 Python files + requirements.txt)"
 
     # Documentation
     foreach ($f in $DocFiles) {
@@ -572,13 +572,12 @@ function Update-HooksConfig {
             "matcher" = "startup|resume"
             "hooks" = @(@{ "type" = "command"; "command" = "bash `"$scriptsFwd/session-start.sh`"" })
         }
-        "PreToolUse" = @{
-            "matcher" = "Edit|Write"
-            "hooks" = @(@{ "type" = "command"; "command" = "bash `"$scriptsFwd/pre-edit.sh`"" })
-        }
         "PostToolUse" = @{
             "matcher" = "Edit|Write"
             "hooks" = @(@{ "type" = "command"; "command" = "bash `"$scriptsFwd/post-edit.sh`"" })
+        }
+        "UserPromptSubmit" = @{
+            "hooks" = @(@{ "type" = "command"; "command" = "bash `"$scriptsFwd/user-prompt.sh`"" })
         }
     }
 

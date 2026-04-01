@@ -21,6 +21,7 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src" / "notemap-mcp")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
+from db import close_db, get_db
 from index import load_or_rebuild_index, save_index
 from notes import create_note, delete_note, read_note, update_note
 from search import search_notes
@@ -56,10 +57,12 @@ class TestRoundtrip(unittest.TestCase):
     """Full CRUD lifecycle tests."""
 
     def setUp(self) -> None:
+        close_db()
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="notemap_rt_"))
         self.index: dict = load_or_rebuild_index(self.tmp_dir)
 
     def tearDown(self) -> None:
+        close_db()
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     # -- 1. Create note and verify index ------------------------------------
@@ -110,13 +113,13 @@ class TestRoundtrip(unittest.TestCase):
             topic="Function search target",
             related_functions=["DB::get"],
         )
-        create_note(self.index, self.tmp_dir, params)
+        result = create_note(self.index, self.tmp_dir, params)
+        note_id = result["id"]
 
         results = search_notes(self.index, {"function_name": "DB::get"})
         self.assertGreaterEqual(results["count"], 1)
         ids = [r["id"] for r in results["results"]]
-        expected_id = self.index[list(self.index.keys())[0]]["id"]
-        self.assertIn(expected_id, ids)
+        self.assertIn(note_id, ids)
 
     # -- 4. Search by query -------------------------------------------------
 
@@ -165,10 +168,11 @@ class TestRoundtrip(unittest.TestCase):
         result = create_note(self.index, self.tmp_dir, params)
         note_id = result["id"]
 
-        # Capture original file path before deletion removes the index entry
-        original_entry = self.index[note_id]
-        original_path  = self.tmp_dir / original_entry["path"]
-        self.assertTrue(original_path.exists(), "Note file should exist before delete")
+        # Verify note exists in index and DB before delete
+        self.assertIn(note_id, self.index)
+        conn = get_db(self.tmp_dir)
+        row = conn.execute("SELECT lifecycle FROM notes WHERE id = ?", (note_id,)).fetchone()
+        self.assertIsNotNone(row, "Note should exist in DB before delete")
 
         del_result = delete_note(self.index, self.tmp_dir, {
             "id":     note_id,
@@ -177,15 +181,13 @@ class TestRoundtrip(unittest.TestCase):
         self.assertNotIn("error", del_result)
         self.assertEqual(del_result["action"], "archived")
 
-        # Gone from index
+        # Gone from in-memory index
         self.assertNotIn(note_id, self.index)
 
-        # Original file removed
-        self.assertFalse(original_path.exists(), "Original file should be gone")
-
-        # Archived file exists
-        archive_path = self.tmp_dir / "_archive" / f"{note_id}.md"
-        self.assertTrue(archive_path.exists(), "Archived file should exist")
+        # Still in DB with lifecycle='archived'
+        row = conn.execute("SELECT lifecycle FROM notes WHERE id = ?", (note_id,)).fetchone()
+        self.assertIsNotNone(row, "Archived note should still be in DB")
+        self.assertEqual(row["lifecycle"], "archived")
 
     # -- 7. Hard-delete: file gone entirely ---------------------------------
 
@@ -193,9 +195,6 @@ class TestRoundtrip(unittest.TestCase):
         params = _make_params(topic="Hard delete target")
         result = create_note(self.index, self.tmp_dir, params)
         note_id = result["id"]
-
-        original_entry = self.index[note_id]
-        original_path  = self.tmp_dir / original_entry["path"]
 
         del_result = delete_note(self.index, self.tmp_dir, {
             "id":          note_id,
@@ -207,12 +206,10 @@ class TestRoundtrip(unittest.TestCase):
         # Gone from index
         self.assertNotIn(note_id, self.index)
 
-        # File removed from disk
-        self.assertFalse(original_path.exists(), "File should be permanently gone")
-
-        # No archive copy
-        archive_path = self.tmp_dir / "_archive" / f"{note_id}.md"
-        self.assertFalse(archive_path.exists(), "Hard-deleted file should not be archived")
+        # Gone from DB entirely (CASCADE deletes related rows too)
+        conn = get_db(self.tmp_dir)
+        row = conn.execute("SELECT id FROM notes WHERE id = ?", (note_id,)).fetchone()
+        self.assertIsNone(row, "Hard-deleted note should be gone from DB")
 
     # -- 8. Duplicate topic returns error -----------------------------------
 
@@ -247,7 +244,7 @@ class TestRoundtrip(unittest.TestCase):
 
     # -- 10. Index on disk matches in-memory after operations ---------------
 
-    def test_index_disk_matches_memory(self) -> None:
+    def test_index_db_matches_memory(self) -> None:
         # Create two notes
         params1 = _make_params(topic="Index sync note one")
         params2 = _make_params(topic="Index sync note two")
@@ -266,25 +263,24 @@ class TestRoundtrip(unittest.TestCase):
             "hard_delete": True,
         })
 
-        # Read the disk index
-        index_path = self.tmp_dir / "_index.json"
-        self.assertTrue(index_path.exists(), "_index.json should be on disk")
-
-        raw = json.loads(index_path.read_text(encoding="utf-8"))
-        disk_notes = raw.get("notes", {})
+        # Reload from SQLite to verify persistence
+        from db import load_all_notes
+        close_db()
+        conn = get_db(self.tmp_dir)
+        db_notes = load_all_notes(conn)
 
         # Same set of IDs
-        self.assertEqual(set(disk_notes.keys()), set(self.index.keys()))
+        self.assertEqual(set(db_notes.keys()), set(self.index.keys()))
 
         # Spot-check a few fields on the surviving note
         surviving_id = r1["id"]
-        self.assertIn(surviving_id, disk_notes)
+        self.assertIn(surviving_id, db_notes)
         self.assertEqual(
-            disk_notes[surviving_id]["review_count"],
+            db_notes[surviving_id]["review_count"],
             self.index[surviving_id]["review_count"],
         )
         self.assertEqual(
-            disk_notes[surviving_id]["lifecycle"],
+            db_notes[surviving_id]["lifecycle"],
             self.index[surviving_id]["lifecycle"],
         )
 
@@ -336,6 +332,108 @@ class TestRoundtrip(unittest.TestCase):
         results = search_notes(self.index, {"query": "xyzzy-nonexistent"})
         self.assertEqual(results["count"], 0)
         self.assertEqual(results["results"], [])
+
+
+class TestHierarchicalLibraryRoundtrip(unittest.TestCase):
+    """CRUD lifecycle tests with hierarchical library names (e.g. javascript/json)."""
+
+    def setUp(self) -> None:
+        close_db()
+        self.tmp_dir = Path(tempfile.mkdtemp(prefix="notemap_hier_"))
+        self.index: dict = load_or_rebuild_index(self.tmp_dir)
+
+    def tearDown(self) -> None:
+        close_db()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_create_with_slash_library(self) -> None:
+        """Creating a note with a hierarchical library stores correctly in DB."""
+        params = _make_params(library="javascript/json", topic="BigInt parse gotcha")
+        result = create_note(self.index, self.tmp_dir, params)
+
+        self.assertNotIn("error", result)
+        note_id = result["id"]
+        self.assertNotIn("/", note_id, "Note ID should not contain slashes")
+        self.assertIn("--", note_id, "Slashes should become double-dashes in ID")
+
+        # Note should be in index with correct library
+        entry = self.index[note_id]
+        self.assertEqual(entry["library"], "javascript/json")
+
+        # Verify in DB
+        conn = get_db(self.tmp_dir)
+        row = conn.execute("SELECT library FROM notes WHERE id = ?", (note_id,)).fetchone()
+        self.assertEqual(row["library"], "javascript/json")
+
+    def test_read_hierarchical_note(self) -> None:
+        """Notes with hierarchical libraries are readable after creation."""
+        params = _make_params(library="python/typing", topic="TypeVar gotcha")
+        result = create_note(self.index, self.tmp_dir, params)
+        note_id = result["id"]
+
+        read_result = read_note(self.index, self.tmp_dir, {"id": note_id})
+        self.assertNotIn("error", read_result)
+        self.assertEqual(read_result["frontmatter"]["library"], "python/typing")
+
+    def test_update_hierarchical_note(self) -> None:
+        """Updates to hierarchical library notes persist correctly."""
+        params = _make_params(library="css/grid", topic="Grid auto-flow gotcha")
+        result = create_note(self.index, self.tmp_dir, params)
+        note_id = result["id"]
+
+        update_result = update_note(self.index, self.tmp_dir, {
+            "id":         note_id,
+            "confidence": "maybe",
+        })
+        self.assertNotIn("error", update_result)
+
+        read_result = read_note(self.index, self.tmp_dir, {"id": note_id})
+        self.assertEqual(read_result["frontmatter"]["confidence"], "maybe")
+
+    def test_delete_hierarchical_note(self) -> None:
+        """Hierarchical library notes can be soft-deleted."""
+        params = _make_params(library="rust/serde", topic="Deserialize lifetime")
+        result = create_note(self.index, self.tmp_dir, params)
+        note_id = result["id"]
+
+        del_result = delete_note(self.index, self.tmp_dir, {
+            "id":     note_id,
+            "reason": "testing hierarchical delete",
+        })
+        self.assertNotIn("error", del_result)
+        self.assertEqual(del_result["action"], "archived")
+        self.assertNotIn(note_id, self.index)
+
+    def test_rebuild_index_finds_hierarchical_notes(self) -> None:
+        """Index rebuild discovers notes in nested library directories."""
+        from index import rebuild_index
+
+        params = _make_params(library="go/concurrency", topic="Channel deadlock")
+        result = create_note(self.index, self.tmp_dir, params)
+        note_id = result["id"]
+
+        # Rebuild from scratch
+        rebuilt = rebuild_index(self.tmp_dir)
+        self.assertIn(note_id, rebuilt)
+        self.assertEqual(rebuilt[note_id]["library"], "go/concurrency")
+
+    def test_search_parent_finds_hierarchical_children(self) -> None:
+        """Searching by parent library finds notes in child libraries."""
+        create_note(self.index, self.tmp_dir, _make_params(
+            library="javascript", topic="Strict mode note",
+        ))
+        create_note(self.index, self.tmp_dir, _make_params(
+            library="javascript/json", topic="JSON parse note",
+        ))
+        create_note(self.index, self.tmp_dir, _make_params(
+            library="javascript/dom", topic="DOM query note",
+        ))
+
+        results = search_notes(self.index, {"library": "javascript"})
+        self.assertEqual(results["count"], 3)
+
+        results = search_notes(self.index, {"library": "javascript/json"})
+        self.assertEqual(results["count"], 1)
 
 
 if __name__ == "__main__":

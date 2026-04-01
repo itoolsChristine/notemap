@@ -436,68 +436,106 @@ class TestAuditOrphanedFunctions(unittest.TestCase):
 
 
 class TestAuditIndexIntegrity(unittest.TestCase):
-    """Tests for the 'index_integrity' audit check."""
+    """Tests for the 'index_integrity' audit check (SQLite-backed)."""
 
     def setUp(self) -> None:
         self.index   = _make_index()
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="notemap_audit_"))
 
     def tearDown(self) -> None:
+        # Close the db module's cached connection so it doesn't leak
+        try:
+            from db import close_db
+            close_db()
+        except Exception:
+            pass
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
+    def _create_db_with_n_notes(self, n: int) -> None:
+        """Create a SQLite DB in tmp_dir with n stub note rows."""
+        import sqlite3
+        db_path = self.tmp_dir / "notemap.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS notes (
+                id TEXT PRIMARY KEY,
+                library TEXT NOT NULL DEFAULT '',
+                topic TEXT NOT NULL DEFAULT '',
+                type TEXT NOT NULL DEFAULT 'knowledge',
+                summary TEXT NOT NULL DEFAULT '',
+                notes_body TEXT NOT NULL DEFAULT '',
+                cues_raw TEXT NOT NULL DEFAULT '',
+                source_quality TEXT NOT NULL DEFAULT 'unverified',
+                confidence TEXT NOT NULL DEFAULT 'maybe',
+                lifecycle TEXT NOT NULL DEFAULT 'active',
+                review_interval_days INTEGER NOT NULL DEFAULT 30,
+                review_tier INTEGER NOT NULL DEFAULT 2,
+                review_count INTEGER NOT NULL DEFAULT 0,
+                miss_count INTEGER NOT NULL DEFAULT 0,
+                created TEXT NOT NULL DEFAULT '',
+                last_modified TEXT NOT NULL DEFAULT '',
+                last_reviewed TEXT NOT NULL DEFAULT '',
+                valid_from TEXT NOT NULL DEFAULT '',
+                valid_until TEXT NOT NULL DEFAULT '',
+                last_retrieved TEXT NOT NULL DEFAULT '',
+                retrieval_count INTEGER NOT NULL DEFAULT 0,
+                library_version TEXT NOT NULL DEFAULT '',
+                always_relevant INTEGER NOT NULL DEFAULT 0,
+                wrong_assumption TEXT NOT NULL DEFAULT '',
+                correct_behavior TEXT NOT NULL DEFAULT '',
+                applies_to TEXT NOT NULL DEFAULT '',
+                sources_json TEXT NOT NULL DEFAULT '[]',
+                miss_log_json TEXT NOT NULL DEFAULT '[]',
+                anchor_text TEXT NOT NULL DEFAULT '',
+                notes_body_search TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        for i in range(n):
+            conn.execute("INSERT INTO notes (id, topic) VALUES (?, ?)",
+                        (f"stub-note-{i}", f"Stub note {i}"))
+        conn.commit()
+        conn.close()
+
     def test_index_integrity_mismatch(self) -> None:
-        """When disk file count differs from index count, status is 'mismatch'."""
-        # Create fewer files on disk than entries in the index
-        zendb_dir = self.tmp_dir / "zendb"
-        zendb_dir.mkdir(parents=True)
-        (zendb_dir / "zendb-get-empty.md").write_text("# Note", encoding="utf-8")
-        (zendb_dir / "zendb-join-keys.md").write_text("# Note", encoding="utf-8")
-        # Only 2 files on disk, 6 in the index
+        """When DB note count differs from index count, status is 'mismatch'."""
+        # Create DB with 2 notes but index has 6
+        self._create_db_with_n_notes(2)
 
         result = audit_notes(self.index, self.tmp_dir, {"check": "index_integrity"})
         integrity = result["index_integrity"]
         self.assertEqual(integrity["status"], "mismatch")
         self.assertEqual(integrity["indexed"], 6)
-        self.assertEqual(integrity["on_disk"], 2)
+        self.assertEqual(integrity["in_db"], 2)
 
     def test_index_integrity_ok_when_counts_match(self) -> None:
-        """When disk file count matches index count, status is 'ok'."""
-        # Create exactly 6 .md files (matching index count)
-        for note_id, entry in self.index.items():
-            note_path = self.tmp_dir / entry["path"]
-            note_path.parent.mkdir(parents=True, exist_ok=True)
-            note_path.write_text(f"# {entry['topic']}", encoding="utf-8")
+        """When DB note count matches index count, status is 'ok'."""
+        # Create DB with exactly 6 notes (matching index count)
+        self._create_db_with_n_notes(6)
 
         result = audit_notes(self.index, self.tmp_dir, {"check": "index_integrity"})
         integrity = result["index_integrity"]
         self.assertEqual(integrity["status"], "ok")
         self.assertEqual(integrity["indexed"], 6)
-        self.assertEqual(integrity["on_disk"], 6)
+        self.assertEqual(integrity["in_db"], 6)
 
-    def test_index_integrity_excludes_archive(self) -> None:
-        """Files in _archive/ are not counted toward the disk count."""
-        # Create files matching the index
-        for note_id, entry in self.index.items():
-            note_path = self.tmp_dir / entry["path"]
-            note_path.parent.mkdir(parents=True, exist_ok=True)
-            note_path.write_text(f"# {entry['topic']}", encoding="utf-8")
-
-        # Add an archived file that should be excluded
-        archive_dir = self.tmp_dir / "_archive"
-        archive_dir.mkdir(parents=True)
-        (archive_dir / "old-note.md").write_text("# Archived", encoding="utf-8")
+    def test_index_integrity_empty_db(self) -> None:
+        """When DB has 0 notes but index has entries, status is 'mismatch'."""
+        self._create_db_with_n_notes(0)
 
         result = audit_notes(self.index, self.tmp_dir, {"check": "index_integrity"})
         integrity = result["index_integrity"]
-        self.assertEqual(integrity["status"], "ok")
-        self.assertEqual(integrity["on_disk"], 6)  # archive file excluded
+        self.assertEqual(integrity["status"], "mismatch")
+        self.assertEqual(integrity["in_db"], 0)
+        self.assertEqual(integrity["indexed"], 6)
 
-    def test_index_integrity_nonexistent_dir(self) -> None:
-        """When notemap_dir does not exist, on_disk stays 0."""
-        nonexistent = self.tmp_dir / "nonexistent_subdir"
-        result = audit_notes(self.index, nonexistent, {"check": "index_integrity"})
+    def test_index_integrity_no_db(self) -> None:
+        """When no DB exists, get_db creates one (empty) -> mismatch."""
+        # tmp_dir exists but has no notemap.db -- get_db will create schema
+        result = audit_notes(self.index, self.tmp_dir, {"check": "index_integrity"})
         integrity = result["index_integrity"]
-        self.assertEqual(integrity["on_disk"], 0)
+        # get_db creates the DB with 0 notes, index has 6 -> mismatch
+        self.assertEqual(integrity["status"], "mismatch")
+        self.assertEqual(integrity["in_db"], 0)
         self.assertEqual(integrity["indexed"], 6)
 
 
@@ -513,6 +551,11 @@ class TestAuditCombined(unittest.TestCase):
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="notemap_audit_"))
 
     def tearDown(self) -> None:
+        try:
+            from db import close_db
+            close_db()
+        except Exception:
+            pass
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     @patch("audit.Path.home")
@@ -813,6 +856,87 @@ class TestReviewQueue(unittest.TestCase):
             self.assertIsInstance(item["reasons"], list)
             for reason in item["reasons"]:
                 self.assertIsInstance(reason, str)
+
+
+class TestConfidenceDecayMutation(unittest.TestCase):
+    """Tests for the confidence_decay audit check with apply_decay parameter."""
+
+    def setUp(self) -> None:
+        from db import close_db, get_db
+        close_db()
+        self.tmp_dir = Path(tempfile.mkdtemp(prefix="notemap_decay_"))
+        # Create a real DB with a note whose confidence should decay
+        self.conn = get_db(self.tmp_dir)
+        self.conn.execute("""
+            INSERT INTO notes (id, library, topic, type, summary, notes_body, cues_raw,
+                             source_quality, confidence, lifecycle,
+                             review_interval_days, review_tier, review_count, miss_count,
+                             created, last_modified, last_reviewed)
+            VALUES ('decay-candidate', 'testlib', 'Decay test note', 'knowledge',
+                    'Summary', 'Notes', '',
+                    'verified-from-source', 'strong', 'active',
+                    30, 2, 1, 0,
+                    ?, ?, ?)
+        """, (_days_ago(120), _days_ago(120), _days_ago(120)))
+        self.conn.commit()
+        # Build matching index entry
+        self.index: dict[str, dict[str, Any]] = {
+            "decay-candidate": {
+                "library":              "testlib",
+                "topic":                "Decay test note",
+                "type":                 "knowledge",
+                "source_quality":       "verified-from-source",
+                "confidence":           "strong",
+                "lifecycle":            "active",
+                "summary":              "Summary",
+                "created":              _days_ago(120),
+                "last_reviewed":        _days_ago(120),
+                "review_interval_days": 30,
+                "miss_count":           0,
+                "review_count":         1,
+                "related_functions":    [],
+                "tags":                 [],
+            },
+        }
+
+    def tearDown(self) -> None:
+        from db import close_db
+        close_db()
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_apply_false_does_not_mutate(self) -> None:
+        """apply_decay=False (default) reports candidates but does NOT update the DB."""
+        result = audit_notes(self.index, self.tmp_dir, {
+            "check":       "confidence_decay",
+            "apply_decay": False,
+        })
+        # Should find the candidate
+        self.assertEqual(len(result["confidence_decay"]), 1)
+        self.assertEqual(result["confidence_decay"][0]["id"], "decay-candidate")
+        self.assertEqual(result["confidence_decay"][0]["suggested_confidence"], "maybe")
+        self.assertEqual(result["confidence_decay_applied"], 0)
+
+        # DB should still have original confidence
+        row = self.conn.execute(
+            "SELECT confidence FROM notes WHERE id = 'decay-candidate'"
+        ).fetchone()
+        self.assertEqual(row["confidence"], "strong")
+
+    def test_apply_true_mutates_database(self) -> None:
+        """apply_decay=True updates confidence values in the database."""
+        result = audit_notes(self.index, self.tmp_dir, {
+            "check":       "confidence_decay",
+            "apply_decay": True,
+        })
+        # Should find and apply to the candidate
+        self.assertEqual(len(result["confidence_decay"]), 1)
+        self.assertEqual(result["confidence_decay_applied"], 1)
+
+        # DB should now have the decayed confidence
+        row = self.conn.execute(
+            "SELECT confidence FROM notes WHERE id = 'decay-candidate'"
+        ).fetchone()
+        self.assertEqual(row["confidence"], "maybe")
 
 
 if __name__ == "__main__":

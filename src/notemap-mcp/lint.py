@@ -8,6 +8,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _library_matches(note_library: str, filter_library: str) -> bool:
+    """Check if *note_library* matches *filter_library* (exact or child)."""
+    if note_library == filter_library:
+        return True
+    return note_library.startswith(filter_library + "/")
+
+
 def lint_code(
     index: dict[str, dict[str, Any]],
     params: dict[str, Any],
@@ -31,7 +38,7 @@ def lint_code(
     for nid, entry in index.items():
         if entry.get("type") != "anti-pattern":
             continue
-        if library and entry.get("library") != library:
+        if library and not _library_matches(entry.get("library", ""), library):
             continue
         anti_patterns.append((nid, entry))
 

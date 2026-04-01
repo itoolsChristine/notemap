@@ -40,8 +40,23 @@ class NoteType(str, enum.Enum):
 
 
 class Lifecycle(str, enum.Enum):
-    ACTIVE = "active"
-    STALE  = "stale"
+    ACTIVE    = "active"
+    STALE     = "stale"
+    EVERGREEN = "evergreen"
+    DORMANT   = "dormant"
+    ARCHIVED  = "archived"
+
+
+class LinkType(str, enum.Enum):
+    RELATED      = "related"
+    SUPERSEDES   = "supersedes"
+    CONTRADICTS  = "contradicts"
+    EXTENDS      = "extends"
+    DEPENDS_ON   = "depends_on"
+    BROAD_MATCH  = "broad_match"
+    NARROW_MATCH = "narrow_match"
+    CLOSE_MATCH  = "close_match"
+    EXACT_MATCH  = "exact_match"
 
 
 class MissReason(str, enum.Enum):
@@ -86,7 +101,19 @@ class IndexEntry:
     miss_log:              list[dict[str, str]]   = field(default_factory=list)
     review_count:          int                    = 0
     related_functions:     list[str]              = field(default_factory=list)
-    related_notes:         list[str]              = field(default_factory=list)
+    related_notes:         list[Any]              = field(default_factory=list)
+
+    # Temporal scoping (Unit 2c)
+    valid_from:            str                    = ""
+    valid_until:           str                    = ""
+
+    # Multi-topic membership (Unit 2e)
+    additional_topics:     list[str]              = field(default_factory=list)
+
+    # Usage tracking (Unit 2e)
+    last_retrieved:        str                    = ""
+    retrieval_count:       int                    = 0
+
     cues:                  list[str]              = field(default_factory=list)
     summary:               str                    = ""
     path:                  str                    = ""

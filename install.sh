@@ -20,11 +20,11 @@ SETTINGS_JSON="$CLAUDE_DIR/settings.json"
 SCRIPTS_DIR="$CLAUDE_DIR/scripts/notemap"
 
 # Files to install (source-relative-path : destination)
-MCP_FILES="server.py notes.py search.py audit.py lint.py preflight.py check.py index.py models.py utils.py"
+MCP_FILES="server.py notes.py search.py audit.py lint.py preflight.py check.py index.py db.py graph.py events.py models.py utils.py embed.py chunk.py rag.py"
 DOC_FILES="notemap.md"
 SKILL_FILES="notemap-review.md"
 COMMAND_FILES="notemap.md"
-HOOK_FILES="session-start.sh pre-edit.sh post-edit.sh"
+HOOK_FILES="session-start.sh post-edit.sh user-prompt.sh"
 
 # ============================================================================
 #  Banner
@@ -326,7 +326,7 @@ install_files() {
     for f in $MCP_FILES; do
         get_file "src/notemap-mcp/$f" "$MCP_DIR/$f"
     done
-    ok "MCP server installed (10 Python files)"
+    ok "MCP server installed (16 Python files)"
 
     # requirements.txt
     get_file "src/notemap-mcp/requirements.txt" "$MCP_DIR/requirements.txt"
@@ -585,13 +585,12 @@ notemap_hooks = {
         "matcher": "startup|resume",
         "hooks": [{"type": "command", "command": f'bash "{scripts_dir}/session-start.sh"'}]
     },
-    "PreToolUse": {
-        "matcher": "Edit|Write",
-        "hooks": [{"type": "command", "command": f'bash "{scripts_dir}/pre-edit.sh"'}]
-    },
     "PostToolUse": {
         "matcher": "Edit|Write",
         "hooks": [{"type": "command", "command": f'bash "{scripts_dir}/post-edit.sh"'}]
+    },
+    "UserPromptSubmit": {
+        "hooks": [{"type": "command", "command": f'bash "{scripts_dir}/user-prompt.sh"'}]
     }
 }
 
@@ -651,16 +650,24 @@ verify() {
         "$MCP_DIR/search.py"
         "$MCP_DIR/audit.py"
         "$MCP_DIR/lint.py"
+        "$MCP_DIR/preflight.py"
+        "$MCP_DIR/check.py"
         "$MCP_DIR/index.py"
+        "$MCP_DIR/db.py"
+        "$MCP_DIR/graph.py"
+        "$MCP_DIR/events.py"
         "$MCP_DIR/models.py"
         "$MCP_DIR/utils.py"
+        "$MCP_DIR/embed.py"
+        "$MCP_DIR/chunk.py"
+        "$MCP_DIR/rag.py"
         "$MCP_DIR/requirements.txt"
         "$DOCS_DIR/notemap.md"
         "$SKILLS_DIR/notemap-review.md"
         "$COMMANDS_DIR/notemap.md"
         "$SCRIPTS_DIR/session-start.sh"
-        "$SCRIPTS_DIR/pre-edit.sh"
         "$SCRIPTS_DIR/post-edit.sh"
+        "$SCRIPTS_DIR/user-prompt.sh"
     )
     for f in "${expected_files[@]}"; do
         if [ ! -f "$f" ]; then
@@ -733,7 +740,7 @@ success_message() {
     echo "  ============================================================"
     echo ""
     echo "    What was installed:"
-    echo "      MCP server:  $MCP_DIR/ (10 Python files)"
+    echo "      MCP server:  $MCP_DIR/ (16 Python files)"
     echo "      Note storage: $NOTES_DIR/"
     echo "      Docs:         $DOCS_DIR/notemap.md"
     echo "      Skill:        $SKILLS_DIR/notemap-review.md"

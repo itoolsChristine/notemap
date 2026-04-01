@@ -47,5 +47,10 @@ Desktop.ini
 # Dev-only preseed scripts
 src/notemap-mcp/preseed*.py
 
+# SQLite database files (user data, not distributed)
+*.db
+*.db-wal
+*.db-shm
+
 # Test artifacts
 temp/

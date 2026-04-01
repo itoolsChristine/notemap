@@ -14,8 +14,14 @@ def slugify_topic(topic: str) -> str:
 
 
 def generate_id(library: str, topic: str) -> str:
-    """Return a unique note ID in the form ``{library}-{slug}``."""
-    return f"{library}-{slugify_topic(topic)}"
+    """Return a unique note ID in the form ``{library}-{slug}``.
+
+    Forward slashes in *library* are replaced with double-dashes so the
+    ID is safe for use as a filename (e.g. ``javascript/json`` becomes
+    ``javascript--json``).
+    """
+    safe_library = library.replace("/", "--")
+    return f"{safe_library}-{slugify_topic(topic)}"
 
 
 def today_str() -> str:
@@ -50,3 +56,13 @@ def fuzzy_suggestions(
 ) -> list[str]:
     """Return up to *max_results* close matches for *query* from *candidates*."""
     return difflib.get_close_matches(query, candidates, n=max_results, cutoff=0.4)
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token count for context budget calculations.
+
+    Uses a len/4 heuristic (roughly 4 characters per token for English text).
+    """
+    if not text:
+        return 0
+    return max(1, len(text) // 4)

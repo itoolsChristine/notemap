@@ -1,80 +1,64 @@
 <!-- NOTEMAP:INSTRUCTIONS:BEGIN -->
-## Notemap -- PERSISTENT KNOWLEDGE BASE
+## Notemap -- Persistent Knowledge Base
 
-**THIS IS A BLOCKING REQUIREMENT when the notemap MCP server is available.** Notemap captures what you LEARN across sessions -- gotchas, correct patterns, anti-patterns, corrections, and working principles. Function maps tell you WHAT exists. Notemap tells you HOW to use it correctly and what to watch out for. This system is standalone and does NOT depend on function maps.
+Notemap is your long-term memory. Notes you create persist across sessions in a
+SQLite database and are searched automatically -- the RAG hook injects relevant
+notes into your context on every user message. You don't need to search manually
+for most knowledge retrieval; it happens behind the scenes.
 
-**You MUST use notemap BEFORE writing code and AFTER writing code. No exceptions. No shortcuts. No "I'll check later." The preflight-then-check workflow catches issues you don't know to search for.**
+### What to do actively
 
-**Notemap applies to shell commands too, not just code.** Before running Bash commands that involve shell-crossing (cmd/powershell from bash), path manipulation, symlinks/junctions, or Windows-specific operations, search or preflight `_cross-cutting` notes. Shell gotchas are just as costly as code gotchas.
+**Session start -- load anti-patterns:** Run notemap_preflight(libraries=[...])
+including _cross-cutting. This loads gotchas and anti-patterns that prevent you
+from repeating mistakes documented in previous sessions.
 
-**Notemap also applies to general learning.** Scan PDFs, URLs, and text files with `/notemap` to capture knowledge for future sessions. Point it at a textbook, documentation page, or transcript to build a persistent knowledge base on any topic.
+**After significant edits -- catch anti-patterns:** Run notemap_check(file_path="...")
+on files where you made non-trivial changes. It detects libraries, runs lint
+against known anti-patterns, and surfaces function-level gotchas. Trivial edits
+(typo fixes, comment changes) don't need this.
 
-### 3 Core Rules
+**When you learn something surprising:** Create a note with notemap_create. If
+you discovered a gotcha, corrected a misconception, or found something that
+contradicts your training data, capture it before moving on. Future sessions
+will benefit.
 
-1. **Preflight before coding.** Call `notemap_preflight(libraries=[...])` at session start or when switching task domains. **Always include `_cross-cutting`** -- it covers shell, environment, and tooling gotchas that apply regardless of which library is in scope. This loads ALL notes for those libraries -- anti-patterns, gotchas, corrections -- organized by impact. You don't need to guess keywords. **Read the anti-patterns it returns and apply them as you code.** Report: `[notemap-preflight: zendb/3, smartstring/4, 2 anti-patterns loaded]`
-2. **Check after coding.** Call `notemap_check(code="...", file_path="...")` after writing or editing code that touches library APIs. You can pass code as a string OR just pass a file_path and it reads the file for you. It auto-detects libraries, runs anti-pattern lint, and surfaces function-specific gotchas. You don't need to know what to search for. Report: `[notemap-check: clean]` or `[notemap-check: 1 warning, 2 function notes]`
-3. **Capture surprises.** When you learn something new, `notemap_create(...)` with `sources` and `library_version`. When a note is wrong, fix or delete it. After recovering from any error, note what went wrong BEFORE moving on.
+**When a note was wrong:** Fix it with notemap_update or delete it with
+notemap_delete. Wrong notes are worse than no notes.
 
-### Identifying Libraries in Scope
+### Confidence tax
 
-Before calling preflight, identify which libraries the project uses:
-- Call `notemap_stats()` to see which libraries have notes in the knowledge base
-- Check `composer.json` / `package.json` for dependencies
-- Check import/require/use statements in the code
-- Check the project's CLAUDE.md for library references
-- When you know library versions (from composer.lock, package.json, project CLAUDE.md), pass them: `notemap_preflight(libraries=[...], versions={"zendb": "3.0"})`
+Your training data is unverified. The code is the ground truth. When your
+confidence comes from training data rather than from reading this project's
+code, notemap, or function map -- stop and verify first.
 
-### When to Use Each Tool
+<examples>
+<example>
+User: "Fix the upload handler to validate file sizes"
+Claude's approach:
+1. notemap_search(function_name="processUpload") -- check for known gotchas
+2. Read the upload handler code
+3. Implement the fix
+4. notemap_check(file_path="src/upload.php") -- verify no anti-patterns introduced
+</example>
+<example>
+User: "Why does DB::get return an empty object instead of null?"
+Claude's approach:
+1. RAG already injected relevant notes about DB::get return types (automatic)
+2. Answer using the note: "DB::get always returns SmartArrayHtml -- empty on
+   no match. Check with ->isEmpty(), not empty()."
+3. notemap_update(id=..., mark_reviewed=true) if the note was helpful
+</example>
+<example>
+User: "I just found out that the cron job silently fails when the lock file exists"
+Claude's approach:
+1. notemap_create with type="anti-pattern", cues that fire when someone touches
+   the cron code, source pointing to the relevant file and lines
+2. Link to related notes about the cron system
+</example>
+</examples>
 
-| Situation | Tool |
-|-----------|------|
-| Session start / new task domain | `notemap_preflight(libraries=[...], versions={...})` |
-| After writing significant code | `notemap_check(file_path="...")` or `notemap_check(code="...")` |
-| Scan a PDF or document | `/notemap /path/to/file.pdf` |
-| Scan a website | `/notemap https://example.com` |
-| Looking up a specific function | `notemap_search(function_name="DB::get")` |
-| Broad keyword exploration | `notemap_search(query="null handling")` |
-| Learned something surprising | `notemap_create(...)` with sources + library_version |
-| Note is wrong or outdated | `notemap_update(...)` or `notemap_delete(...)` |
-| What libraries have notes? | `notemap_stats()` |
-| Anti-pattern spot-check only | `notemap_lint(code="...", library="...")` |
-| Periodic maintenance | `/notemap review` |
+### Reference
 
-### Choosing a Note Type
-
-Ask: "What is this note FOR?"
-
-- Preventing a mistake I'd repeat -> `anti-pattern` (if regex-detectable) or `correction` (if misconception)
-- Recording how something works -> `knowledge`
-- Recording a fact to look up later -> `reference`
-- Recording how to do something well -> `technique`
-- Recording a rule/standard to follow -> `convention`
-- Recording why a choice was made -> `decision`
-- Recording what I found/observed -> `finding`
-
-### Cross-Reference with Function Maps
-
-After finding functions in the function map, the preflight already includes function-level notes via `function_index`. If you skipped preflight, at minimum run `notemap_check` on your code before finishing.
-
-### Source Citations (mandatory for new notes)
-
-Every note should have structured `sources` so claims can be verified during review:
-- `{type: "file", path: "src/ConnectionInternals.php", lines: "395-405"}`
-- `{type: "url", url: "https://docs.anthropic.com/...", section: "Rate limits"}`
-- `{type: "user", context: "User corrected: DB::get returns SmartArrayHtml not SmartNull"}`
-
-### Confidence Tax
-
-Your training data is UNVERIFIED until confirmed against actual code. The code is the ground truth. Before reaching for a language built-in, ask: does this codebase have its own way of doing this?
-
-**Concretely:** When your confidence comes from training data rather than from reading THIS project's code, notemap, or function map -- STOP and verify first.
-
-### Evidence Quality
-
-When creating notes, tag each claim with source quality and confidence:
-- **Source quality:** verified-from-source > runtime-tested > documented > function-map > user-correction > inferred > unverified
-- **Confidence:** strong / maybe / weak
-- Rule: `unverified` can never pair with `strong`. Note what you DON'T know.
-
-@docs/notemap.md
+Full tool list (14 tools), note creation guidelines, search architecture, and
+review system: @docs/notemap.md
 <!-- NOTEMAP:INSTRUCTIONS:END -->

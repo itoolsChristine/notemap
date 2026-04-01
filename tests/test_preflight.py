@@ -627,5 +627,90 @@ class TestPreflightEdgeCases(unittest.TestCase):
         self.assertIn("top_cue", conventions[0])
 
 
+class TestPreflightHierarchicalLibrary(unittest.TestCase):
+    """Tests for hierarchical library matching in preflight."""
+
+    def setUp(self) -> None:
+        self.index: dict[str, dict[str, Any]] = {
+            "js-strict": {
+                "library":            "javascript",
+                "library_version":    "",
+                "topic":              "Strict mode differences",
+                "type":               "knowledge",
+                "lifecycle":          "active",
+                "summary":            "Use strict mode.",
+                "related_functions":  [],
+                "cues":               [],
+                "tags":               [],
+            },
+            "js--json-bigint": {
+                "library":            "javascript/json",
+                "library_version":    "",
+                "topic":              "JSON parse BigInt gotcha",
+                "type":               "anti-pattern",
+                "lifecycle":          "active",
+                "summary":            "JSON.parse truncates BigInt.",
+                "related_functions":  ["JSON.parse"],
+                "primitives_to_avoid":    ["JSON\\.parse"],
+                "preferred_alternatives": ["BigInt-safe parser"],
+                "cues":               [],
+                "tags":               [],
+            },
+            "js--dom-null": {
+                "library":            "javascript/dom",
+                "library_version":    "",
+                "topic":              "querySelector returns null",
+                "type":               "knowledge",
+                "lifecycle":          "active",
+                "summary":            "querySelector can return null.",
+                "related_functions":  ["document.querySelector"],
+                "cues":               [],
+                "tags":               [],
+            },
+        }
+
+    def test_parent_library_loads_all_children(self) -> None:
+        """Preflighting 'javascript' includes notes from javascript/* children."""
+        result = preflight_notes(self.index, {
+            "libraries":            ["javascript"],
+            "include_cross_cutting": False,
+        })
+        self.assertEqual(result["summary"]["total_notes"], 3)
+        loaded = result["summary"]["libraries_loaded"]
+        self.assertIn("javascript", loaded)
+        self.assertIn("javascript/json", loaded)
+        self.assertIn("javascript/dom", loaded)
+
+    def test_child_library_loads_only_itself(self) -> None:
+        """Preflighting 'javascript/json' only loads that child's notes."""
+        result = preflight_notes(self.index, {
+            "libraries":            ["javascript/json"],
+            "include_cross_cutting": False,
+        })
+        self.assertEqual(result["summary"]["total_notes"], 1)
+        loaded = result["summary"]["libraries_loaded"]
+        self.assertEqual(loaded, ["javascript/json"])
+
+    def test_partial_name_does_not_match(self) -> None:
+        """'java' should NOT match 'javascript' in preflight filtering."""
+        result = preflight_notes(self.index, {
+            "libraries":            ["java"],
+            "include_cross_cutting": False,
+        })
+        self.assertEqual(result["summary"]["total_notes"], 0)
+
+    def test_hierarchical_tiers_correct(self) -> None:
+        """Anti-pattern child notes land in watch_out, knowledge in know_this."""
+        result = preflight_notes(self.index, {
+            "libraries":            ["javascript"],
+            "include_cross_cutting": False,
+        })
+        wo_ids = {n["id"] for n in result["tiers"]["watch_out"]}
+        kt_ids = {n["id"] for n in result["tiers"]["know_this"]}
+        self.assertIn("js--json-bigint", wo_ids)
+        self.assertIn("js-strict", kt_ids)
+        self.assertIn("js--dom-null", kt_ids)
+
+
 if __name__ == "__main__":
     unittest.main()

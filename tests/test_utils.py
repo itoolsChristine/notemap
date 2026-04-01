@@ -148,6 +148,23 @@ class TestGenerateId(unittest.TestCase):
         id2 = generate_id("zendb", "topic beta")
         self.assertNotEqual(id1, id2)
 
+    def test_forward_slash_replaced_with_double_dash(self) -> None:
+        """Slashes in library names are replaced with '--' for safe filenames."""
+        result = generate_id("javascript/json", "BigInt gotcha")
+        self.assertNotIn("/", result)
+        self.assertTrue(result.startswith("javascript--json-"))
+
+    def test_deeply_nested_library_slashes(self) -> None:
+        """Multiple slashes are each replaced with '--'."""
+        result = generate_id("a/b/c", "test topic")
+        self.assertNotIn("/", result)
+        self.assertTrue(result.startswith("a--b--c-"))
+
+    def test_no_slash_library_unchanged(self) -> None:
+        """Libraries without slashes are not affected by slash handling."""
+        result = generate_id("zendb", "some topic")
+        self.assertNotIn("--", result.split("-", 1)[0])
+
 
 # ===================================================================
 # today_str

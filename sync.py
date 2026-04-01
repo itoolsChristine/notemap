@@ -43,8 +43,14 @@ PYTHON_FILES = [
     ("notemap-mcp/preflight.py",    "notemap-mcp/preflight.py"),
     ("notemap-mcp/check.py",        "notemap-mcp/check.py"),
     ("notemap-mcp/index.py",        "notemap-mcp/index.py"),
+    ("notemap-mcp/graph.py",        "notemap-mcp/graph.py"),
+    ("notemap-mcp/db.py",           "notemap-mcp/db.py"),
+    ("notemap-mcp/events.py",       "notemap-mcp/events.py"),
     ("notemap-mcp/models.py",       "notemap-mcp/models.py"),
     ("notemap-mcp/utils.py",        "notemap-mcp/utils.py"),
+    ("notemap-mcp/embed.py",        "notemap-mcp/embed.py"),
+    ("notemap-mcp/chunk.py",        "notemap-mcp/chunk.py"),
+    ("notemap-mcp/rag.py",          "notemap-mcp/rag.py"),
     ("notemap-mcp/requirements.txt", "notemap-mcp/requirements.txt"),
 ]
 
@@ -62,8 +68,8 @@ COMMAND_FILES = [
 
 HOOK_FILES = [
     ("scripts/notemap/session-start.sh", "hooks/session-start.sh"),
-    ("scripts/notemap/pre-edit.sh",      "hooks/pre-edit.sh"),
     ("scripts/notemap/post-edit.sh",     "hooks/post-edit.sh"),
+    ("scripts/notemap/user-prompt.sh",   "hooks/user-prompt.sh"),
 ]
 
 # Sentinel tags for the CLAUDE.md notemap section

@@ -69,6 +69,20 @@ FUNCTION_PATTERNS = [
 # Public API
 # ---------------------------------------------------------------------------
 
+def _library_in_set(note_library: str, filter_set: set[str]) -> bool:
+    """Check if *note_library* matches any library in *filter_set*.
+
+    Supports hierarchical matching: if ``"zendb"`` is in *filter_set*,
+    a note with ``library="zendb/internals"`` also matches.
+    """
+    if note_library in filter_set:
+        return True
+    for lib in filter_set:
+        if note_library.startswith(lib + "/"):
+            return True
+    return False
+
+
 def check_code(
     index: dict[str, dict[str, Any]],
     params: dict[str, Any],
@@ -234,14 +248,20 @@ def _code_check_path(
             if nid in seen_note_ids:
                 continue
 
-            # Library must be in detected set
+            # Library must match, OR note is always-relevant
             note_lib = entry.get("library", "")
-            if note_lib not in lib_filter:
+            if not entry.get("always_relevant") and not _library_in_set(note_lib, lib_filter):
                 continue
 
             # Only active notes
             if entry.get("lifecycle", "active") != "active":
                 continue
+
+            # Library-combination requirement
+            req_libs = entry.get("requires_libraries") or []
+            if req_libs:
+                if not all(rl in detected for rl in req_libs):
+                    continue
 
             # Check related_functions for a match
             # Short names (< 4 chars) require exact match to avoid false positives
@@ -311,10 +331,70 @@ def _code_check_path(
         function_notes = deduped
 
     # ------------------------------------------------------------------
-    # Step 5 -- Build return dict
+    # Step 5 -- Proactive "also relevant" from related_notes
+    # ------------------------------------------------------------------
+    also_relevant: list[dict[str, Any]] = []
+    seen_also: set[str] = set(seen_note_ids)  # Don't duplicate already-surfaced notes
+    # Also exclude notes already in function_notes
+    for fn_entry in function_notes:
+        for note_info in fn_entry.get("notes", []):
+            seen_also.add(note_info.get("id", ""))
+
+    for fn_entry in function_notes:
+        for note_info in fn_entry.get("notes", []):
+            primary_id = note_info.get("id", "")
+            primary_entry = index.get(primary_id, {})
+            related = primary_entry.get("related_notes") or []
+            for link in related:
+                link_id = link.get("id", link) if isinstance(link, dict) else link
+                if link_id in seen_also:
+                    continue
+                seen_also.add(link_id)
+                linked_entry = index.get(link_id)
+                if linked_entry and linked_entry.get("lifecycle", "active") in ("active", "evergreen"):
+                    also_relevant.append({
+                        "id": link_id,
+                        "type": linked_entry.get("type", "knowledge"),
+                        "summary": linked_entry.get("summary", ""),
+                        "library": linked_entry.get("library", ""),
+                        "via": primary_id,
+                    })
+
+    # ------------------------------------------------------------------
+    # Step 6 -- Build return dict
     # ------------------------------------------------------------------
     total_fn_notes = sum(len(fn["notes"]) for fn in function_notes)
     issues_found   = len(all_warnings) + total_fn_notes
+
+    # ------------------------------------------------------------------
+    # Step 7 -- Implicit review: mark relevant notes as reviewed when clean
+    # ------------------------------------------------------------------
+    implicitly_reviewed: list[str] = []
+    if issues_found == 0:
+        from utils import today_str
+        from db import get_db
+        from index import get_notemap_dir
+        today = today_str()
+        reviewed_ids: list[str] = []
+        for nid, entry in index.items():
+            note_lib = entry.get("library", "")
+            if not _library_in_set(note_lib, detected):
+                continue
+            if entry.get("lifecycle", "active") != "active":
+                continue
+            related = entry.get("related_functions") or []
+            if any(fn in function_refs for fn in related):
+                entry["last_reviewed"] = today
+                reviewed_ids.append(nid)
+        if reviewed_ids:
+            conn = get_db(get_notemap_dir())
+            for nid in reviewed_ids:
+                conn.execute(
+                    "UPDATE notes SET last_reviewed = ?, review_count = review_count + 1 WHERE id = ?",
+                    (today, nid)
+                )
+            conn.commit()
+            implicitly_reviewed = reviewed_ids
 
     # Build human-readable summary line
     summary_line = _build_summary_line(all_warnings, function_notes)
@@ -322,15 +402,19 @@ def _code_check_path(
     # Remove _cross-cutting from the reported libraries (internal detail)
     reported_libs = sorted(lib for lib in detected if lib != "_cross-cutting")
 
-    return {
+    result = {
         "detected_libraries": reported_libs,
         "lint_warnings":      all_warnings,
         "function_notes":     function_notes,
+        "also_relevant":      also_relevant if also_relevant else [],
         "clean":              issues_found == 0,
         "issues_found":       issues_found,
         "mode":               "code-check",
         "summary_line":       summary_line,
     }
+    if implicitly_reviewed:
+        result["implicitly_reviewed"] = implicitly_reviewed
+    return result
 
 
 # ---------------------------------------------------------------------------

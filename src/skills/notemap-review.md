@@ -65,6 +65,13 @@ Notemap Review Complete:
 - Still pending: N
 ```
 
+### Review Quality Guidelines
+
+- **Review approach guidance:** Reviews should focus on the notes that most need attention, not exhaust an arbitrary quota. Prioritize by: (1) notes with recent misses, (2) notes with stale sources, (3) notes never reviewed since creation, (4) notes overdue by the most days. Stop when the remaining queue items are low-priority and well-confirmed.
+- **Tiered verification depth:** Not every review needs full verification. Three tiers: (1) Existence check - does the cited source still exist? (2) Structural check - does the function/class still have the same signature? (3) Full review - read the source and verify the note's claims line by line. Use tier 1 for routine reviews, tier 3 for notes with miss_count > 0 or weak confidence.
+- **Review safeguards against mass-action:** During `/notemap review`, do not mark more than 5 notes as reviewed in a single pass without actually reading their source citations. Batch mark_reviewed is an invitation to rubber-stamping. Each review should verify at least one claim.
+- **Pruning guidelines (decision matrix):** When encountering a note during review: DELETE if the function/feature no longer exists. ARCHIVE if the note is correct but for a library version you no longer use. CONSOLIDATE if there are 3+ notes covering overlapping territory on the same function. UPDATE if the note is partially correct but needs refreshing. KEEP if the note is accurate, has good sources, and has been retrieved recently.
+
 ## Key Principle
 
 The review is Claude's job, not the user's. The user invokes `/notemap review` and gets a report. They only need to make decisions on the flagged items. This follows the 80/20 ratio: Claude does 80% of the review work (reading, verifying, marking), the user handles the 20% that requires judgment.

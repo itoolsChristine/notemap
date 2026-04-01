@@ -145,7 +145,7 @@ echo "  --- Post-install integrity checks ---"
 echo ""
 
 # MCP server files
-for f in server.py notes.py search.py audit.py lint.py preflight.py check.py index.py models.py utils.py; do
+for f in server.py notes.py search.py audit.py lint.py preflight.py check.py index.py db.py graph.py events.py models.py utils.py embed.py chunk.py rag.py; do
     check "[ -f '$TEMP_DIR/.claude/notemap-mcp/$f' ]" "MCP file installed: $f"
 done
 check "[ -f '$TEMP_DIR/.claude/notemap-mcp/requirements.txt' ]" "MCP file installed: requirements.txt"
@@ -165,7 +165,7 @@ check "[ -d '$TEMP_DIR/.claude/notemap' ]" "Note storage directory created"
 # CLAUDE.md -- sentinels present
 check "grep -q 'NOTEMAP:INSTRUCTIONS:BEGIN' '$TEMP_DIR/.claude/CLAUDE.md'" "CLAUDE.md has BEGIN sentinel"
 check "grep -q 'NOTEMAP:INSTRUCTIONS:END' '$TEMP_DIR/.claude/CLAUDE.md'" "CLAUDE.md has END sentinel"
-check "grep -q 'Notemap -- PERSISTENT KNOWLEDGE BASE' '$TEMP_DIR/.claude/CLAUDE.md'" "CLAUDE.md has notemap heading"
+check "grep -q 'Notemap -- Persistent Knowledge Base' '$TEMP_DIR/.claude/CLAUDE.md'" "CLAUDE.md has notemap heading"
 check "grep -q '@docs/notemap.md' '$TEMP_DIR/.claude/CLAUDE.md'" "CLAUDE.md has @docs reference"
 
 # CLAUDE.md -- pre-existing content preserved
@@ -217,8 +217,8 @@ import server
 
 # Hook scripts installed
 check "[ -f '$TEMP_DIR/.claude/scripts/notemap/session-start.sh' ]" "Hook installed: session-start.sh"
-check "[ -f '$TEMP_DIR/.claude/scripts/notemap/pre-edit.sh' ]" "Hook installed: pre-edit.sh"
 check "[ -f '$TEMP_DIR/.claude/scripts/notemap/post-edit.sh' ]" "Hook installed: post-edit.sh"
+check "[ -f '$TEMP_DIR/.claude/scripts/notemap/user-prompt.sh' ]" "Hook installed: user-prompt.sh"
 
 # settings.json -- notemap hooks registered
 SETTINGS_WIN=$(win_path "$TEMP_DIR/.claude/settings.json")
@@ -227,10 +227,10 @@ import json
 d = json.load(open(r'$SETTINGS_WIN'))
 hooks = d.get('hooks', {})
 assert 'SessionStart' in hooks, 'SessionStart not in hooks'
-assert 'PreToolUse' in hooks, 'PreToolUse not in hooks'
 assert 'PostToolUse' in hooks, 'PostToolUse not in hooks'
+assert 'UserPromptSubmit' in hooks, 'UserPromptSubmit not in hooks'
 # Verify notemap entries exist by checking command paths
-for event in ['SessionStart', 'PreToolUse', 'PostToolUse']:
+for event in ['SessionStart', 'PostToolUse', 'UserPromptSubmit']:
     found = False
     for group in hooks[event]:
         for h in group.get('hooks', []):
@@ -266,7 +266,7 @@ echo "y" | bash "$PROJECT_ROOT/install.sh" 2>&1 > /dev/null
 check "$PYTHON -c \"
 import json
 d = json.load(open(r'$SETTINGS_WIN'))
-for event in ['SessionStart', 'PreToolUse', 'PostToolUse']:
+for event in ['SessionStart', 'PostToolUse', 'UserPromptSubmit']:
     notemap_count = 0
     for group in d.get('hooks', {}).get(event, []):
         for h in group.get('hooks', []):
@@ -346,7 +346,7 @@ check "[ ! -f '$TEMP_DIR/.claude/skills/notemap-review.md' ]" "Skill removed: no
 # CLAUDE.md -- sentinels removed
 check "! grep -q 'NOTEMAP:INSTRUCTIONS:BEGIN' '$TEMP_DIR/.claude/CLAUDE.md'" "CLAUDE.md: BEGIN sentinel removed"
 check "! grep -q 'NOTEMAP:INSTRUCTIONS:END' '$TEMP_DIR/.claude/CLAUDE.md'" "CLAUDE.md: END sentinel removed"
-check "! grep -q 'Notemap -- PERSISTENT KNOWLEDGE BASE' '$TEMP_DIR/.claude/CLAUDE.md'" "CLAUDE.md: notemap section removed"
+check "! grep -q 'Notemap -- Persistent Knowledge Base' '$TEMP_DIR/.claude/CLAUDE.md'" "CLAUDE.md: notemap section removed"
 
 # CLAUDE.md -- pre-existing content still preserved after uninstall
 check "grep -q 'Existing Section' '$TEMP_DIR/.claude/CLAUDE.md'" "CLAUDE.md still has: Existing Section"

@@ -1,11 +1,11 @@
 """MCP server entry point for the notemap Cornell note-taking system.
 
-Registers 11 tools via FastMCP and connects them to implementation modules.
+Registers 14 tools via FastMCP and connects them to implementation modules.
 Uses stdio transport for communication with Claude Code.
 """
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.0.10"
 
 import json
 import traceback
@@ -14,13 +14,24 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from index import load_or_rebuild_index, save_index
+from db import get_db, close_db
+from index import load_or_rebuild_index, save_index, get_backlinks, get_backlink_index
 from notes import create_note, read_note, update_note, delete_note
 from search import search_notes
 from audit import audit_notes, review_queue
 from lint import lint_code
 from preflight import preflight_notes
 from check import check_code
+from events import init_events, log_co_retrieval, log_event, log_search_miss
+
+try:
+    from embed import EMBEDDINGS_AVAILABLE, encode_text, MODEL_NAME, DIMENSIONS, invalidate_cache
+except ImportError:
+    EMBEDDINGS_AVAILABLE = False
+    encode_text = None
+    MODEL_NAME = ""
+    DIMENSIONS = 0
+    invalidate_cache = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -33,34 +44,21 @@ NOTEMAP_DIR = Path.home() / ".claude" / "notemap"
 # ---------------------------------------------------------------------------
 
 _index: dict[str, dict[str, Any]] | None = None
-_index_load_time: float = 0.0
+_events_initialized: bool = False
 
 
 def get_index() -> dict[str, dict[str, Any]]:
-    """Load or rebuild the in-memory index, checking for staleness."""
-    global _index, _index_load_time
-    import time
+    """Load the in-memory index from SQLite."""
+    global _index
 
-    now = time.monotonic()
-    needs_load = _index is None
-
-    # Periodically check if any .md file is newer than our in-memory load
-    if not needs_load and (now - _index_load_time) > 5.0:
-        index_path = NOTEMAP_DIR / "_index.json"
-        if index_path.exists():
-            index_mtime = index_path.stat().st_mtime
-            for md_file in NOTEMAP_DIR.rglob("*.md"):
-                rel = md_file.relative_to(NOTEMAP_DIR)
-                if rel.parts and rel.parts[0] == "_archive":
-                    continue
-                if md_file.stat().st_mtime > index_mtime:
-                    needs_load = True
-                    break
-
-    if needs_load:
+    if _index is None:
         NOTEMAP_DIR.mkdir(parents=True, exist_ok=True)
         _index = load_or_rebuild_index(NOTEMAP_DIR)
-        _index_load_time = now
+
+    global _events_initialized
+    if not _events_initialized:
+        init_events(NOTEMAP_DIR)
+        _events_initialized = True
 
     return _index
 
@@ -101,7 +99,7 @@ def notemap_create(
     confidence: str = "weak",
     library_version: str | None = None,
     related_functions: list[str] | None = None,
-    related_notes: list[str] | None = None,
+    related_notes: list[dict | str] | None = None,
     sources: list[dict] | None = None,
     primitives_to_avoid: list[str] | None = None,
     preferred_alternatives: list[str] | None = None,
@@ -111,8 +109,15 @@ def notemap_create(
 ) -> str:
     """Create a new Cornell note.
 
+    library is the topic/domain this note belongs to (e.g., 'zendb', 'python',
+    'javascript/json'). Hierarchical names with '/' create nested directories.
+
     Requires library, topic, notes body, and summary. Returns the created
     note's ID and path on success.
+
+    related_notes accepts plain ID strings or typed link dicts:
+      - "other-note-id"  (defaults to type "related")
+      - {"id": "other-note-id", "type": "related|extends|depends_on|supersedes|contradicts"}
 
     Sources is a list of dicts, each with a "type" key and type-specific fields:
       - {type: "file", path: "src/DB.php", lines: "304-335"}
@@ -142,7 +147,6 @@ def notemap_create(
             "applies_to":             applies_to,
         }
         result = create_note(index, NOTEMAP_DIR, params)
-        save_index(NOTEMAP_DIR, index)
         return json.dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
@@ -164,6 +168,40 @@ def notemap_read(
     try:
         index = get_index()
         result = read_note(index, NOTEMAP_DIR, {"id": id, "section": section})
+
+        # Add linked note summaries when reading successfully
+        if "error" not in result and id in index:
+            entry = index[id]
+            related = entry.get("related_notes") or []
+            linked_summaries: list[dict[str, str]] = []
+
+            for link in related:
+                link_id = link.get("id", link) if isinstance(link, dict) else link
+                link_type = link.get("type", "related") if isinstance(link, dict) else "related"
+                linked_entry = index.get(link_id)
+                if linked_entry:
+                    linked_summaries.append({
+                        "id": link_id,
+                        "direction": "outgoing",
+                        "type": link_type,
+                        "topic": linked_entry.get("topic", ""),
+                        "summary": linked_entry.get("summary", ""),
+                    })
+
+            for bl in get_backlinks(id):
+                bl_entry = index.get(bl["source"])
+                if bl_entry:
+                    linked_summaries.append({
+                        "id": bl["source"],
+                        "direction": "incoming",
+                        "type": bl["type"],
+                        "topic": bl_entry.get("topic", ""),
+                        "summary": bl_entry.get("summary", ""),
+                    })
+
+            if linked_summaries:
+                result["linked_notes"] = linked_summaries
+
         return json.dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
@@ -184,8 +222,16 @@ def notemap_search(
     confidence: str | None = None,
     lifecycle: str = "active",
     max_results: int = 0,
+    include_chunks: bool = False,
 ) -> str:
-    """Search notes by keyword, library, function, tag, or type.
+    """Search notes by keyword, library/topic, function, tag, or type.
+
+    library filters by topic/domain. Supports hierarchical matching:
+    library='javascript' matches both 'javascript' and 'javascript/json'.
+    Also matches notes that list the library in their additional_topics.
+
+    include_chunks=True also searches ingested document chunks by embedding
+    similarity and returns them in a separate 'chunks' key.
 
     Returns matching notes ranked by relevance score. max_results=0 means all.
     """
@@ -201,8 +247,16 @@ def notemap_search(
             "confidence":     confidence,
             "lifecycle":      lifecycle,
             "max_results":    max_results,
+            "include_chunks": include_chunks,
         }
         result = search_notes(index, params)
+        result_ids = [r["id"] for r in result.get("results", [])]
+        for rid in result_ids:
+            log_event(rid, "searched", "notemap_search")
+        if len(result_ids) >= 2:
+            log_co_retrieval(result_ids, "notemap_search")
+        if result.get("count", 0) == 0 and (query or function_name):
+            log_search_miss(query or function_name)
         return json.dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
@@ -232,6 +286,7 @@ def notemap_update(
     wrong_assumption: str | None = None,
     correct_behavior: str | None = None,
     applies_to: str | None = None,
+    new_library: str | None = None,
     mark_reviewed: bool = False,
     increment_miss: bool = False,
     miss_reason: str | None = None,
@@ -241,6 +296,8 @@ def notemap_update(
     List/set fields (cues, tags, related_functions, related_notes,
     primitives_to_avoid, preferred_alternatives) accept a dict with
     an "add" and/or "remove" key for incremental updates.
+
+    new_library moves the note to a different library.
 
     Sources is a list of dicts (full replacement, not incremental):
       - {type: "file", path: "src/DB.php", lines: "304-335"}
@@ -268,14 +325,17 @@ def notemap_update(
             "wrong_assumption":       wrong_assumption,
             "correct_behavior":       correct_behavior,
             "applies_to":             applies_to,
+            "new_library":            new_library,
             "mark_reviewed":          mark_reviewed,
             "increment_miss":         increment_miss,
             "miss_reason":            miss_reason,
         }
-        # Strip None values so "key in params" checks in update_note only trigger for explicitly-set fields
         params = {k: v for k, v in params.items() if v is not None}
         result = update_note(index, NOTEMAP_DIR, params)
-        save_index(NOTEMAP_DIR, index)
+        if mark_reviewed:
+            log_event(id, "reviewed", "notemap_update")
+        if increment_miss:
+            log_event(id, "missed", "notemap_update")
         return json.dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
@@ -293,8 +353,8 @@ def notemap_delete(
 ) -> str:
     """Delete (archive) a note by ID.
 
-    Soft-deletes by default (moves to _archive/). Pass hard_delete=True
-    to permanently remove the file.
+    Soft-deletes by default (sets lifecycle to archived). Pass hard_delete=True
+    to permanently remove.
     """
     try:
         index = get_index()
@@ -304,7 +364,6 @@ def notemap_delete(
             "hard_delete": hard_delete,
         }
         result = delete_note(index, NOTEMAP_DIR, params)
-        save_index(NOTEMAP_DIR, index)
         return json.dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
@@ -319,18 +378,26 @@ def notemap_audit(
     check: str = "all",
     stale_days: int | None = None,
     library: str | None = None,
+    apply_decay: bool = False,
 ) -> str:
     """Find notes needing attention.
 
+    library filters by topic/domain. Supports hierarchical matching.
+
     Checks: stale, low_confidence, unreviewed, high_miss_count,
-    orphaned_functions, index_integrity, or all.
+    orphaned_functions, index_integrity, source_changed, density,
+    consolidation, confidence_decay, or all.
+
+    apply_decay: when True and check includes confidence_decay, mutates
+    notes in the database to apply the suggested confidence downgrades.
     """
     try:
         index = get_index()
         params: dict[str, Any] = {
-            "check":      check,
-            "stale_days": stale_days,
-            "library":    library,
+            "check":       check,
+            "stale_days":  stale_days,
+            "library":     library,
+            "apply_decay": apply_decay,
         }
         result = audit_notes(index, NOTEMAP_DIR, params)
         return json.dumps(result, indent=2)
@@ -348,6 +415,8 @@ def notemap_review(
     limit: int = 0,
 ) -> str:
     """Get a prioritized review queue.
+
+    library filters by topic/domain. Supports hierarchical matching.
 
     Returns notes most in need of review, ranked by staleness, miss count,
     and confidence level. Limit=0 means return all.
@@ -375,6 +444,8 @@ def notemap_lint(
 ) -> str:
     """Check code against known anti-patterns from notes.
 
+    library filters by topic/domain. Supports hierarchical matching.
+
     Scans the provided code string for primitives_to_avoid and returns
     warnings with preferred alternatives.
     """
@@ -398,14 +469,13 @@ def notemap_lint(
 def notemap_stats() -> str:
     """Get an overview of the notemap knowledge base.
 
-    Returns: total note count, libraries with note counts,
+    Returns: total note count, libraries/topics with note counts,
     note type breakdown, and overall health indicators.
-    Use this at session start to discover what libraries have notes.
+    Use this at session start to discover what topics have notes.
     """
     try:
         index = get_index()
 
-        # Count by library
         libs: dict[str, int] = {}
         types: dict[str, int] = {}
         stale_count = 0
@@ -424,13 +494,107 @@ def notemap_stats() -> str:
                     and entry.get("source_quality") in ("inferred", "unverified")):
                 low_conf_count += 1
 
+        backlinks = get_backlink_index()
+        total_notes = len(index)
+        notes_with_links = 0
+        total_links = 0
+
+        for nid, entry in index.items():
+            related = entry.get("related_notes") or []
+            incoming = backlinks.get(nid) or []
+            link_count = len(related) + len(incoming)
+            if link_count > 0:
+                notes_with_links += 1
+            total_links += len(related)
+
+        # Health metrics: utilization from events table
+        retrieved_note_ids: set[str] = set()
+        try:
+            conn = get_db(NOTEMAP_DIR)
+            from datetime import datetime, timedelta, timezone
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            rows = conn.execute("""
+                SELECT DISTINCT note_id FROM events
+                WHERE timestamp >= ? AND event IN ('searched', 'check_surfaced', 'preflight_loaded')
+                AND note_id != ''
+            """, (cutoff,)).fetchall()
+            retrieved_note_ids = {r["note_id"] for r in rows}
+        except Exception:
+            pass
+
+        utilization_rate = len(retrieved_note_ids) / total_notes if total_notes > 0 else 0.0
+
+        coverage: dict[str, dict[str, int]] = {}
+        for nid, entry in index.items():
+            lib = entry.get("library", "unknown")
+            ntype = entry.get("type", "knowledge")
+            if lib not in coverage:
+                coverage[lib] = {}
+            coverage[lib][ntype] = coverage[lib].get(ntype, 0) + 1
+
+        from datetime import date as _date_type
+        review_backlog = 0
+        tier_sum       = 0
+        tier_count     = 0
+        for nid, entry in index.items():
+            if entry.get("lifecycle") not in ("active",):
+                continue
+            tier = entry.get("review_tier", 2)
+            tier_sum += tier
+            tier_count += 1
+            last_reviewed = entry.get("last_reviewed", "")
+            interval = entry.get("review_interval_days", 30)
+            if last_reviewed:
+                try:
+                    reviewed = _date_type.fromisoformat(last_reviewed)
+                    if (_date_type.today() - reviewed).days > interval:
+                        review_backlog += 1
+                except (ValueError, TypeError):
+                    pass
+
+        # Embedding statistics
+        notes_with_embeddings = 0
+        chunks_with_embeddings = 0
+        total_chunks = 0
+        try:
+            conn_stats = get_db(NOTEMAP_DIR)
+            ne_row = conn_stats.execute("SELECT COUNT(*) as cnt FROM note_embeddings").fetchone()
+            notes_with_embeddings = ne_row["cnt"] if ne_row else 0
+            ce_row = conn_stats.execute("SELECT COUNT(*) as cnt FROM chunk_embeddings").fetchone()
+            chunks_with_embeddings = ce_row["cnt"] if ce_row else 0
+            tc_row = conn_stats.execute("SELECT COUNT(*) as cnt FROM chunks").fetchone()
+            total_chunks = tc_row["cnt"] if tc_row else 0
+        except Exception:
+            pass
+
         result = {
             "version": __version__,
-            "total_notes": len(index),
+            "total_notes": total_notes,
             "libraries": dict(sorted(libs.items(), key=lambda x: -x[1])),
             "note_types": types,
             "stale_notes": stale_count,
             "low_confidence_notes": low_conf_count,
+            "connection_stats": {
+                "notes_with_links": notes_with_links,
+                "total_links": total_links,
+                "avg_links_per_note": round(total_links / max(total_notes, 1), 2),
+                "orphan_count": total_notes - notes_with_links,
+            },
+            "health": {
+                "utilization_rate_90d": round(utilization_rate, 3),
+                "notes_retrieved_90d":  len(retrieved_note_ids),
+                "coverage_matrix":      coverage,
+                "review_backlog":       review_backlog,
+                "avg_review_tier":      round(tier_sum / tier_count, 2) if tier_count > 0 else 0,
+            },
+            "embeddings": {
+                "available": EMBEDDINGS_AVAILABLE,
+                "model": MODEL_NAME if EMBEDDINGS_AVAILABLE else None,
+                "notes_with_embeddings": notes_with_embeddings,
+                "chunks_with_embeddings": chunks_with_embeddings,
+                "total_notes": total_notes,
+                "total_chunks": total_chunks,
+            },
         }
         return json.dumps(result, indent=2)
     except Exception as exc:
@@ -446,10 +610,15 @@ def notemap_preflight(
     libraries: list[str],
     versions: dict | None = None,
     include_cross_cutting: bool = True,
+    context_budget: int = 0,
+    topic_focus: str = "",
 ) -> str:
-    """Load all notes for the specified libraries in a compact briefing format.
+    """Load all notes for the specified libraries/topics in a compact briefing format.
 
     Call this at session start or when switching to a new task domain.
+    libraries is a list of topic/domain names to load notes for.
+    Also includes notes that list any requested library in their additional_topics.
+
     Returns all notes organized by priority: anti-patterns first, then
     corrections, knowledge, and conventions, grouped by library.
 
@@ -459,6 +628,14 @@ def notemap_preflight(
     versions is an optional dict mapping library names to version strings
     (e.g., {"zendb": "3.0", "smartstring": "2.8"}). When provided, notes
     with incompatible library_version fields are excluded.
+
+    context_budget is the maximum token budget for the response (0 = unlimited).
+    When set, notes are assigned detail levels (0-3) to fit within the budget.
+    Anti-patterns always get full detail. Other notes are ranked by relevance.
+
+    topic_focus is an optional string describing the current task focus.
+    When set and embeddings are available, uses semantic similarity to
+    prioritize the most relevant notes within the budget.
     """
     try:
         index = get_index()
@@ -466,8 +643,13 @@ def notemap_preflight(
             "libraries":             libraries,
             "versions":              versions,
             "include_cross_cutting": include_cross_cutting,
+            "context_budget":        context_budget,
+            "topic_focus":           topic_focus,
         }
         result = preflight_notes(index, params)
+        for tier_name in ("watch_out", "know_this", "reference"):
+            for note in result.get("tiers", {}).get(tier_name, []):
+                log_event(note.get("id", ""), "preflight_loaded", "notemap_preflight")
         return json.dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
@@ -486,8 +668,8 @@ def notemap_check(
     """Check code against notemap knowledge: anti-patterns, function gotchas,
     and cross-cutting notes.
 
-    Auto-detects libraries from code patterns (DB::, SmartString, etc.) and
-    file extension. Runs lint + function-specific note lookup in one call.
+    Auto-detects libraries/topics from code patterns (DB::, SmartString, etc.)
+    and file extension. Runs lint + function-specific note lookup in one call.
     Returns a consolidated report of everything noteworthy.
 
     Call this after writing code to catch issues you don't know to search for.
@@ -506,7 +688,277 @@ def notemap_check(
             "versions":  versions,
         }
         result = check_code(index, params)
+        for w in result.get("lint_warnings", []):
+            log_event(w.get("note_id", ""), "check_warning", "notemap_check")
+        check_note_ids: list[str] = []
+        for fn in result.get("function_notes", []):
+            for n in fn.get("notes", []):
+                nid = n.get("id", "")
+                log_event(nid, "check_surfaced", "notemap_check")
+                if nid:
+                    check_note_ids.append(nid)
+        if len(check_note_ids) >= 2:
+            log_co_retrieval(check_note_ids, "notemap_check")
         return json.dumps(result, indent=2)
+    except Exception as exc:
+        return _error_response(str(exc), traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# Tool: notemap_connections
+# ---------------------------------------------------------------------------
+
+@mcp_server.tool()
+def notemap_connections(
+    note_id: str | None = None,
+    operation: str = "neighborhood",
+    target_id: str | None = None,
+    max_hops: int = 2,
+) -> str:
+    """Query the knowledge graph for connections, paths, and suggestions.
+
+    Operations:
+        neighborhood  - show notes connected to note_id within max_hops
+        path          - find shortest path from note_id to target_id
+        suggest_links - suggest new related_notes for note_id
+        suggest_hubs  - find libraries that need hub/structure notes
+        pagerank      - show top notes by PageRank importance
+        communities   - show detected note communities
+        bridges       - show top notes by betweenness centrality
+    """
+    try:
+        index = get_index()
+        backlinks = get_backlink_index()
+
+        from graph import (
+            betweenness_centrality,
+            get_neighborhood,
+            louvain_communities,
+            pagerank,
+            shortest_path,
+            suggest_hub_notes,
+        )
+
+        if operation == "neighborhood":
+            if not note_id:
+                return json.dumps({"error": "note_id required for neighborhood"})
+            result = get_neighborhood(index, backlinks, note_id, max_hops)
+            return json.dumps({"note_id": note_id, "neighborhood": result, "count": len(result)}, indent=2)
+
+        elif operation == "path":
+            if not note_id or not target_id:
+                return json.dumps({"error": "note_id and target_id required for path"})
+            path = shortest_path(index, backlinks, note_id, target_id)
+            if path:
+                return json.dumps({"from": note_id, "to": target_id, "path": path, "hops": len(path) - 1}, indent=2)
+            return json.dumps({"from": note_id, "to": target_id, "path": None, "message": "No path found"}, indent=2)
+
+        elif operation == "suggest_hubs":
+            suggestions = suggest_hub_notes(index, backlinks)
+            return json.dumps({"suggestions": suggestions, "count": len(suggestions)}, indent=2)
+
+        elif operation == "pagerank":
+            scores = pagerank(index, backlinks)
+            top = sorted(scores.items(), key=lambda x: -x[1])[:20]
+            return json.dumps({
+                "top_notes": [
+                    {"id": nid, "score": round(s, 6), "topic": index.get(nid, {}).get("topic", "")}
+                    for nid, s in top
+                ],
+            }, indent=2)
+
+        elif operation == "communities":
+            comms = louvain_communities(index, backlinks)
+            groups: dict[int, list[str]] = {}
+            for nid, c in comms.items():
+                groups.setdefault(c, []).append(nid)
+            sorted_groups = sorted(groups.items(), key=lambda x: -len(x[1]))
+            result_groups = []
+            for comm_id, members in sorted_groups[:20]:
+                result_groups.append({
+                    "community": comm_id,
+                    "size": len(members),
+                    "members": members[:10],
+                    "sample_topics": [index.get(m, {}).get("topic", "")[:60] for m in members[:5]],
+                })
+            return json.dumps({"communities": result_groups, "total_communities": len(groups)}, indent=2)
+
+        elif operation == "bridges":
+            scores = betweenness_centrality(index, backlinks)
+            top = sorted(scores.items(), key=lambda x: -x[1])[:20]
+            return json.dumps({
+                "top_bridges": [
+                    {"id": nid, "centrality": round(s, 6), "topic": index.get(nid, {}).get("topic", "")}
+                    for nid, s in top
+                ],
+            }, indent=2)
+
+        elif operation == "suggest_links":
+            if not note_id or note_id not in index:
+                return json.dumps({"error": "valid note_id required"})
+            entry = index[note_id]
+            topic_words = set(w.lower() for w in (entry.get("topic") or "").split() if len(w) >= 3)
+            note_tags = set(t.lower() for t in (entry.get("tags") or []))
+            note_fns = set(f.lower() for f in (entry.get("related_functions") or []))
+
+            suggestions: list[dict[str, Any]] = []
+            for eid, e in index.items():
+                if eid == note_id:
+                    continue
+                score = 0
+                reasons: list[str] = []
+                ex_fns = set(f.lower() for f in (e.get("related_functions") or []))
+                shared = note_fns & ex_fns
+                if shared:
+                    score += len(shared) * 40
+                    reasons.append(f"shared functions: {', '.join(sorted(shared))}")
+                ex_tw = set(w.lower() for w in (e.get("topic") or "").split() if len(w) >= 3)
+                sw = topic_words & ex_tw
+                if len(sw) >= 2:
+                    score += len(sw) * 10
+                    reasons.append("topic overlap")
+                ex_tags = set(t.lower() for t in (e.get("tags") or []))
+                st = note_tags & ex_tags
+                if st:
+                    score += len(st) * 15
+                    reasons.append(f"shared tags: {', '.join(sorted(st))}")
+                if score >= 30:
+                    suggestions.append({"id": eid, "score": score, "reasons": reasons, "topic": e.get("topic", "")})
+
+            suggestions.sort(key=lambda x: -x["score"])
+            return json.dumps({"note_id": note_id, "suggestions": suggestions[:10]}, indent=2)
+
+        else:
+            return json.dumps({"error": f"Unknown operation: {operation}. Valid: neighborhood, path, suggest_links, suggest_hubs, pagerank, communities, bridges"})
+
+    except Exception as exc:
+        return _error_response(str(exc), traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# Tool: notemap_ingest
+# ---------------------------------------------------------------------------
+
+@mcp_server.tool()
+def notemap_ingest(
+    content: str,
+    library: str,
+    source_type: str = "text",
+    source_path: str = "",
+    source_title: str = "",
+) -> str:
+    """Ingest text content by chunking, embedding, and storing for retrieval.
+
+    Use this after reading a PDF/document to store the raw text as searchable
+    chunks. Chunks are automatically embedded for semantic search.
+    """
+    try:
+        try:
+            from chunk import chunk_with_sections, store_chunks
+        except ImportError:
+            return _error_response(
+                "Chunking module not available",
+                "chunk.py is required for ingestion",
+            )
+
+        get_index()  # ensure DB + events initialized
+
+        chunks = chunk_with_sections(content, source_type, source_path, source_title)
+        if not chunks:
+            return json.dumps({
+                "chunks_created": 0,
+                "source": source_path,
+                "library": library,
+                "message": "No chunks produced from content (empty or whitespace-only)",
+            }, indent=2)
+
+        conn = get_db(NOTEMAP_DIR)
+        chunk_ids = store_chunks(chunks, conn)
+
+        log_event(
+            note_id="",
+            event_type="ingestion_complete",
+            tool="notemap_ingest",
+            metadata={
+                "source": source_path,
+                "source_title": source_title,
+                "library": library,
+                "chunks_created": len(chunk_ids),
+                "source_type": source_type,
+            },
+        )
+
+        return json.dumps({
+            "chunks_created": len(chunk_ids),
+            "source": source_path,
+            "library": library,
+            "message": f"Ingested {len(chunk_ids)} chunk(s) from '{source_title or source_path or 'inline text'}'",
+        }, indent=2)
+    except Exception as exc:
+        return _error_response(str(exc), traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# Tool: notemap_embed
+# ---------------------------------------------------------------------------
+
+@mcp_server.tool()
+def notemap_embed(
+    force: bool = False,
+) -> str:
+    """Generate embeddings for all notes that lack them.
+
+    Use force=True to re-embed all notes (e.g., after model upgrade).
+    Returns a count of notes embedded and the model used.
+    """
+    try:
+        if not EMBEDDINGS_AVAILABLE or encode_text is None:
+            return json.dumps({
+                "embedded": 0,
+                "total_notes": len(get_index()),
+                "model": None,
+                "available": False,
+                "message": "Embeddings not available. Install model2vec: pip install model2vec",
+            }, indent=2)
+
+        index = get_index()
+        conn = get_db(NOTEMAP_DIR)
+
+        if force:
+            rows = conn.execute(
+                "SELECT id, topic, summary, notes_body FROM notes"
+            ).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT n.id, n.topic, n.summary, n.notes_body
+                FROM notes n
+                LEFT JOIN note_embeddings ne ON ne.note_id = n.id
+                WHERE ne.vector IS NULL
+            """).fetchall()
+
+        embedded = 0
+        for row in rows:
+            embed_text = f"{row['topic']} {row['summary']} {row['notes_body']}"
+            vec_bytes = encode_text(embed_text)
+            if vec_bytes is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO note_embeddings (note_id, model, dimensions, vector) VALUES (?, ?, ?, ?)",
+                    (row["id"], MODEL_NAME, DIMENSIONS, vec_bytes),
+                )
+                embedded += 1
+
+        conn.commit()
+        if invalidate_cache and embedded > 0:
+            invalidate_cache()
+
+        total_notes = len(index)
+        return json.dumps({
+            "embedded": embedded,
+            "total_notes": total_notes,
+            "model": MODEL_NAME,
+            "available": True,
+            "message": f"Embedded {embedded} note(s) using {MODEL_NAME}",
+        }, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 

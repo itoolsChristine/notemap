@@ -47,7 +47,7 @@ Usage:
   /notemap stats               Show note counts by library
   /notemap help                Show this help
 
-MCP Tools (available directly in conversation):
+14 MCP Tools (available directly in conversation):
   notemap_preflight  Load all notes for libraries (session start)
   notemap_check      Auto-detect libraries & check code for issues
   notemap_create     Create a new note
@@ -59,6 +59,9 @@ MCP Tools (available directly in conversation):
   notemap_review     Get prioritized review queue
   notemap_lint       Check code against anti-pattern notes
   notemap_stats      Overview of libraries and note counts
+  notemap_connections Query the knowledge graph (connections, paths, communities)
+  notemap_embed      Generate/refresh embeddings for all notes (batch)
+  notemap_ingest     Chunk and ingest text content for semantic search
 ```
 
 Then stop.
@@ -73,51 +76,146 @@ Delegate to the `/notemap review` skill. Pass through any library name and limit
 
 ## Mode: PDF Scan
 
-Scan a PDF file and create notes on its content.
+Scan a PDF file and create notes on its content. This workflow is designed to handle
+book-length documents (500+ pages) with resume support across sessions.
 
-### Step 1: Read the PDF
+### Step 0: Check for existing scan progress
 
-- Read the PDF using the Read tool (Claude's PDF reading capability)
-- Choose a `library` name from the filename (lowercase, no extension, slugified -- e.g., `system-design-primer` from `System Design Primer.pdf`)
-- Report what was found:
+Search for an existing progress note:
+```
+notemap_search(query="scan progress", library="slugified-name", max_results=1)
+```
 
+If a progress note exists, read it to find out which pages were already scanned.
+Resume from the next unscanned page. Skip Step 1 (survey already done).
+
+### Step 1: Survey the document (SQ3R "Survey" step)
+
+Before scanning page-by-page, survey the document structure:
+
+- Read the first 5 pages (title page, table of contents, preface/introduction)
+- Identify the subject domain, structure (chapters/sections), and total scope
+- Choose a `library` name from the filename (lowercase, no extension, slugified - e.g., `cognitive-psychology` from `Cognitive Psychology.pdf`)
+
+**Create a structural overview note:**
+```
+notemap_create(
+  library="slugified-name",
+  topic="[Book Title] - structural overview",
+  type="reference",
+  notes="Chapters: 1. [topic], 2. [topic], ... N. [topic]\nTotal pages: N\nKey themes: ...",
+  summary="Structural overview of [Book Title] covering [subject] across N chapters.",
+  cues=["What topics does [Book Title] cover?", "What chapter covers [topic]?"],
+  source_quality="documented",
+  confidence="strong",
+  sources=[{type: "file", path: "/path/to/file.pdf", section: "Table of Contents"}],
+  tags=["overview", "structure"]
+)
+```
+
+**Create a scan progress note** (updated after each batch):
+```
+notemap_create(
+  library="slugified-name",
+  topic="[Book Title] - scan progress",
+  type="reference",
+  notes="Pages scanned: 1-5 of N\nPages remaining: 6-N\nNotes created: 1 (overview)\nLast scanned: [date]",
+  summary="Scan progress tracker for [Book Title]. Resume from page 6.",
+  cues=["scan progress"],
+  source_quality="documented",
+  confidence="strong"
+)
+```
+
+Report what was found:
 ```
 Source: /path/to/file.pdf
-Title: [title from content or filename]
+Title: [title from content]
 Pages: N
-Subject: [brief description of what the document covers]
-Library name for notes: slugified-name
+Subject: [brief description]
+Structure: N chapters covering [key topics]
+Library: slugified-name
 ```
 
 ### Step 2: Scan and take notes
 
-Apply the three-gate filter: only note what's Relevant, Important, and Reliable.
+Read the PDF in batches of 20 pages. For each batch:
 
-Scan systematically section by section. For each noteworthy finding:
+**A. Ingest raw text** - Preserve the original text for semantic search:
+```
+notemap_ingest(code=raw_text_from_pages, library="slugified-name")
+```
+This stores the raw passages as searchable chunks. Even passages that don't become
+distilled notes remain findable via semantic search.
 
-1. Select the note type using the decision tree (see "Choosing Note Types" below)
-2. Create the note with `notemap_create`:
-   - `library`: the slugified name from Step 1
-   - `sources`: `[{type: "file", path: "/path/to/the.pdf", section: "Chapter X, p.Y"}]`
-   - `cues`: write as situational questions (not trivia recall)
-   - `source_quality`: documented
-   - `confidence`: strong
-3. Continue to next finding
+**B. Create distilled notes** - Use the 3-pass pipeline:
+
+1. **Extract**: Identify noteworthy passages in this batch
+2. **Crystallize**: Distill each into an atomic note with metadata
+3. **Connect**: Search for related existing notes and link them
+
+For each note, apply the three-gate filter:
+- **Relevant?** Would this knowledge change how someone approaches a problem in this domain?
+- **Important?** Would getting this wrong lead to a misconception or incorrect application?
+- **Reliable?** Is this well-supported by the source material?
+
+What to look for (varies by document type):
+
+**For textbooks**: Capture principles and mental models, not definitions. Focus on:
+- Causal mechanisms (X happens BECAUSE Y)
+- Common misconceptions the book corrects
+- Relationships between concepts
+- Techniques and methods with their rationale
+- Surprising findings or counterintuitive results
+
+**For API docs**: Focus on gotchas, not every method signature.
+**For tutorials**: Capture the "why" behind steps, not the steps.
+**For reference material**: Capture facts someone would look up, with enough context to apply them.
+
+Create each note with `notemap_create`:
+- `library`: the slugified name from Step 1
+- `sources`: `[{type: "file", path: "/path/to/the.pdf", section: "Chapter X, p.Y"}]`
+- `cues`: Write as questions someone would ask when they NEED this knowledge.
+  Not "What is photosynthesis?" (trivia) but "Why must the light reactions happen before
+  the Calvin cycle?" (situational - fires when someone is reasoning about the process)
+- `related_notes`: Search for and link to related notes within this library
+- `source_quality`: documented
+- `confidence`: strong
+
+**C. Update scan progress** - After each batch, update the progress note:
+```
+notemap_update(id="progress-note-id", notes="Pages scanned: 1-N of TOTAL\n...")
+```
+
+**D. Move to next 20 pages** and repeat A-C.
+
+### Stopping signals (stop when 3 of 5 are true)
+
+1. Last 3 notes are all knowledge/reference (no gotchas or misconceptions found)
+2. Finding more duplicates than new notes
+3. Remaining content is background, not actionable
+4. All major chapters/sections covered
+5. Notes getting abstract rather than specific
+
+**Quality test**: "Would someone search for terms in this note when they need to apply this
+knowledge?" If the answer is no, skip it.
 
 ### Step 3: Report
 
 ```
 Scan complete: /path/to/file.pdf
   Created: N notes (N knowledge, N technique, N reference, ...)
+  Ingested: N chunks of raw text
   Library: slugified-name
 
-  Notes created:
-  - [type] Topic summary
-  - [type] Topic summary
+  Notes by chapter:
+  - Ch.1 [title]: N notes
+  - Ch.2 [title]: N notes
   - ...
 
   To search: notemap_search(library="slugified-name")
   To review: /notemap review slugified-name
+  To resume: /notemap /path/to/file.pdf (auto-detects progress)
 ```
 
 ## Mode: Text Scan

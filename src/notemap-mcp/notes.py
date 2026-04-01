@@ -1,11 +1,11 @@
-"""CRUD operations for Cornell-format notemap notes."""
+"""CRUD operations for notemap notes, backed by SQLite."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
-import frontmatter
-
+from db import get_db, load_note_dict, _build_anchor_text, _update_anchor_text_for
 from index import remove_entry, save_index, update_entry
 from models import Lifecycle, NoteType
 from utils import (
@@ -16,128 +16,14 @@ from utils import (
     today_str,
 )
 
-
-# ---------------------------------------------------------------------------
-# Section helpers
-# ---------------------------------------------------------------------------
-
-def _extract_sections(body: str) -> dict[str, str]:
-    """Split a Cornell-note markdown body into its three sections.
-
-    Returns a dict with keys ``cues``, ``notes``, ``summary``.  Each value
-    is the raw text between its heading and the next heading (or EOF),
-    with leading/trailing whitespace stripped.
-    """
-    sections: dict[str, str] = {"cues": "", "notes": "", "summary": ""}
-    current_key: str | None = None
-    current_lines: list[str] = []
-    heading_map = {
-        "cues": "cues",
-        "notes": "notes",
-        "summary": "summary",
-    }
-
-    for line in body.splitlines(keepends=True):
-        stripped = line.strip().lower()
-        if stripped.startswith("## "):
-            # Flush previous section
-            if current_key is not None:
-                sections[current_key] = "".join(current_lines).strip()
-            heading_text = stripped[3:].strip()
-            current_key = heading_map.get(heading_text)
-            current_lines = []
-        else:
-            current_lines.append(line)
-
-    # Flush last section
-    if current_key is not None:
-        sections[current_key] = "".join(current_lines).strip()
-
-    return sections
-
-
-def _build_body(cues: list[str], notes_text: str, summary_text: str) -> str:
-    """Reassemble the three Cornell sections into a markdown body."""
-    cue_lines = "\n".join(f"- {c}" for c in cues) if cues else ""
-    parts = [
-        "## Cues",
-        cue_lines,
-        "",
-        "## Notes",
-        notes_text,
-        "",
-        "## Summary",
-        summary_text,
-    ]
-    return "\n".join(parts) + "\n"
-
-
-def _cues_from_section(section_text: str) -> list[str]:
-    """Parse bullet lines from the Cues section into a plain list."""
-    cues: list[str] = []
-    for line in section_text.splitlines():
-        line = line.strip()
-        if line.startswith("- "):
-            cues.append(line[2:].strip())
-        elif line.startswith("* "):
-            cues.append(line[2:].strip())
-        elif line:
-            cues.append(line)
-    return cues
-
-
-# ---------------------------------------------------------------------------
-# Frontmatter builder
-# ---------------------------------------------------------------------------
-
-def _build_frontmatter(params: dict[str, Any], note_id: str) -> dict[str, Any]:
-    """Construct the full YAML frontmatter dict for a new note."""
-    today = today_str()
-    note_type = params.get("type", NoteType.KNOWLEDGE.value)
-    is_anti_pattern = note_type == NoteType.ANTI_PATTERN.value
-
-    review_intervals: dict[str, int] = {
-        NoteType.ANTI_PATTERN.value: 60,
-        NoteType.TECHNIQUE.value:    90,
-        NoteType.REFERENCE.value:    90,
-        NoteType.DECISION.value:     180,
-        NoteType.FINDING.value:      60,
-    }
-
-    fm: dict[str, Any] = {
-        "id":                    note_id,
-        "library":               params["library"],
-        "type":                  note_type,
-        "topic":                 params["topic"],
-        "tags":                  params.get("tags", []),
-        "source_quality":        params.get("source_quality", "unverified"),
-        "confidence":            params.get("confidence", "weak"),
-        "lifecycle":             "active",
-        "library_version":       params.get("library_version", ""),
-        "created":               today,
-        "last_modified":         today,
-        "last_reviewed":         today,
-        "review_interval_days":  review_intervals.get(note_type, 30),
-        "miss_count":            0,
-        "miss_log":              [],
-        "review_count":          0,
-        "related_functions":     params.get("related_functions", []),
-        "related_notes":         params.get("related_notes", []),
-        "sources":               params.get("sources", []),
-    }
-
-    # Anti-pattern specific fields
-    if is_anti_pattern:
-        fm["primitives_to_avoid"]   = params.get("primitives_to_avoid", [])
-        fm["preferred_alternatives"] = params.get("preferred_alternatives", [])
-
-    # Correction-specific fields
-    if note_type == NoteType.CORRECTION.value:
-        fm["wrong_assumption"]  = params.get("wrong_assumption", "")
-        fm["correct_behavior"]  = params.get("correct_behavior", "")
-        fm["applies_to"]        = params.get("applies_to", "")
-
-    return fm
+try:
+    from embed import encode_text, EMBEDDINGS_AVAILABLE, MODEL_NAME, DIMENSIONS, invalidate_cache
+except ImportError:
+    EMBEDDINGS_AVAILABLE = False
+    encode_text = None
+    MODEL_NAME = ""
+    DIMENSIONS = 0
+    invalidate_cache = None
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +35,7 @@ def create_note(
     notemap_dir: Path,
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    """Create a new Cornell-format note.
+    """Create a new note.
 
     Returns a result dict with ``id``, ``path``, and ``message`` on success,
     or ``error`` on failure.
@@ -164,33 +50,277 @@ def create_note(
             "error": f"Note '{note_id}' already exists. Use update_note to modify it.",
         }
 
-    # Paths
-    lib_dir  = notemap_dir / library
-    ensure_dir(lib_dir)
-    slug     = slugify_topic(topic)
-    filepath = lib_dir / f"{slug}.md"
+    # Quality warnings (non-blocking)
+    warnings: list[str] = []
 
-    # Frontmatter + body
-    fm_dict    = _build_frontmatter(params, note_id)
-    cues_list  = params.get("cues", [])
-    body       = _build_body(cues_list, params["notes"], params["summary"])
-    post       = frontmatter.Post(body, **fm_dict)
+    # Duplicate detection: check if a very similar note already exists
+    similar_notes: list[str] = []
+    topic_lower = topic.lower()
+    for existing_id, existing_entry in index.items():
+        if existing_entry.get("library") != library:
+            continue
+        existing_topic = (existing_entry.get("topic") or "").lower()
+        topic_words    = set(topic_lower.split())
+        existing_words = set(existing_topic.split())
+        if len(topic_words) >= 3 and len(existing_words) >= 3:
+            overlap       = topic_words & existing_words
+            overlap_ratio = len(overlap) / min(len(topic_words), len(existing_words))
+            if overlap_ratio > 0.6:
+                similar_notes.append(existing_id)
 
-    filepath.write_text(frontmatter.dumps(post), encoding="utf-8")
+    if similar_notes:
+        warnings.append(f"Similar notes may exist: {', '.join(similar_notes[:3])}. Consider updating instead of creating a new note.")
 
-    # Update index
-    entry_data          = dict(fm_dict)
-    entry_data["cues"]  = cues_list
-    entry_data["summary"] = params["summary"]
-    entry_data["path"]  = str(filepath.relative_to(notemap_dir))
-    update_entry(index, note_id, entry_data)
-    save_index(notemap_dir, index)
+    # Check summary quality
+    summary_text = params.get("summary", "").strip()
+    if not summary_text:
+        warnings.append("Missing summary. Notes without summaries are harder to find.")
+    elif len(summary_text.split()) < 5:
+        warnings.append("Summary is very short (< 5 words). Consider a more descriptive summary.")
 
-    return {
-        "id":      note_id,
-        "path":    str(filepath.resolve()),
-        "message": f"Created note '{note_id}' at {filepath.resolve()}",
+    # Check sources
+    if not params.get("sources"):
+        warnings.append("No sources provided. Note will be unverifiable.")
+
+    # Check related_functions for relevant types
+    note_type = params.get("type", "knowledge")
+    if note_type in ("anti-pattern", "knowledge", "correction") and not params.get("related_functions"):
+        warnings.append(f"No related_functions for {note_type} note. Function names are the strongest search signal.")
+
+    # Check body length
+    body_text  = params.get("notes", "").strip()
+    body_words = len(body_text.split()) if body_text else 0
+    if body_words > 500:
+        warnings.append(f"Note body is {body_words} words. Consider splitting into atomic notes.")
+    if body_words < 10 and body_text:
+        warnings.append(f"Note body is very short ({body_words} words). May not provide enough context.")
+
+    # Density notice
+    lib_count = sum(1 for e in index.values() if e.get("library") == library)
+    if lib_count > 30:
+        warnings.append(f"Library '{library}' already has {lib_count} notes. Consider consolidating or splitting into subtopics.")
+
+    # Link suggestions
+    suggested_links: list[dict[str, Any]] = []
+    topic_words = set(w.lower() for w in topic.split() if len(w) >= 3)
+    note_tags = set(t.lower() for t in (params.get("tags") or []))
+    note_functions = set(f.lower() for f in (params.get("related_functions") or []))
+
+    for existing_id, existing_entry in index.items():
+        if existing_entry.get("library") != library:
+            continue
+
+        link_score = 0
+        reasons: list[str] = []
+
+        ex_functions = set(f.lower() for f in (existing_entry.get("related_functions") or []))
+        shared_fns = note_functions & ex_functions
+        if shared_fns:
+            link_score += len(shared_fns) * 40
+            reasons.append(f"shared functions: {', '.join(sorted(shared_fns))}")
+
+        ex_topic_words = set(w.lower() for w in (existing_entry.get("topic") or "").split() if len(w) >= 3)
+        shared_words = topic_words & ex_topic_words
+        if len(shared_words) >= 2:
+            link_score += len(shared_words) * 10
+            reasons.append(f"topic overlap: {', '.join(sorted(shared_words))}")
+
+        ex_tags = set(t.lower() for t in (existing_entry.get("tags") or []))
+        shared_tags = note_tags & ex_tags
+        if shared_tags:
+            link_score += len(shared_tags) * 15
+            reasons.append(f"shared tags: {', '.join(sorted(shared_tags))}")
+
+        if link_score >= 40:
+            suggested_links.append({
+                "id": existing_id,
+                "score": link_score,
+                "reasons": reasons,
+            })
+
+    # Unlinked mentions
+    unlinked: list[dict[str, str]] = []
+    body_lower = params.get("notes", "").lower()
+    if body_lower:
+        for existing_id, existing_entry in index.items():
+            if existing_id == note_id:
+                continue
+            ex_topic = (existing_entry.get("topic") or "").lower()
+            ex_words = [w for w in ex_topic.split() if len(w) >= 4]
+            if len(ex_words) >= 2:
+                matches = sum(1 for w in ex_words if w in body_lower)
+                if matches >= len(ex_words) * 0.6:
+                    unlinked.append({
+                        "id": existing_id,
+                        "topic": existing_entry.get("topic", ""),
+                    })
+
+    # Build data for DB insert
+    today = today_str()
+    is_anti_pattern = note_type == NoteType.ANTI_PATTERN.value
+
+    review_intervals: dict[str, int] = {
+        NoteType.ANTI_PATTERN.value: 60,
+        NoteType.TECHNIQUE.value:    90,
+        NoteType.REFERENCE.value:    90,
+        NoteType.DECISION.value:     180,
+        NoteType.FINDING.value:      60,
     }
+
+    cues_list = params.get("cues", []) or []
+    notes_body = params.get("notes", "").strip()
+    context_prefix = "This note is about %s in %s" % (topic, library)
+    notes_body_search = (context_prefix + ". " + notes_body)[:500]
+    tags_text = " ".join(params.get("tags") or [])
+
+    conn = get_db(notemap_dir)
+
+    conn.execute("""
+        INSERT INTO notes (
+            id, library, topic, type, summary, notes_body, cues_raw,
+            source_quality, confidence, lifecycle,
+            review_interval_days, review_tier, review_count, miss_count,
+            created, last_modified, last_reviewed,
+            valid_from, valid_until,
+            last_retrieved, retrieval_count,
+            library_version, always_relevant,
+            wrong_assumption, correct_behavior, applies_to,
+            sources_json, miss_log_json,
+            notes_body_search, tags_text
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        note_id,
+        library,
+        topic,
+        note_type,
+        summary_text,
+        notes_body,
+        "\n".join(cues_list),
+        params.get("source_quality", "unverified"),
+        params.get("confidence", "weak"),
+        "active",
+        review_intervals.get(note_type, 30),
+        2,  # review_tier
+        0,  # review_count
+        0,  # miss_count
+        today,
+        today,
+        today,
+        today,  # valid_from
+        "",     # valid_until
+        "",     # last_retrieved
+        0,      # retrieval_count
+        params.get("library_version") or "",
+        0,      # always_relevant
+        params.get("wrong_assumption", "") or "",
+        params.get("correct_behavior", "") or "",
+        params.get("applies_to", "") or "",
+        json.dumps(params.get("sources") or []),
+        json.dumps([]),
+        notes_body_search,
+        tags_text,
+    ))
+
+    # Tags
+    for tag in (params.get("tags") or []):
+        conn.execute("INSERT OR IGNORE INTO note_tags VALUES (?, ?)", (note_id, tag))
+
+    # Related functions
+    for fn in (params.get("related_functions") or []):
+        conn.execute("INSERT OR IGNORE INTO note_functions VALUES (?, ?)", (note_id, fn))
+
+    # Related notes
+    link_target_ids: list[str] = []
+    for link in (params.get("related_notes") or []):
+        if isinstance(link, str):
+            target_id = link
+            link_type = "related"
+        elif isinstance(link, dict):
+            target_id = link.get("id", "")
+            link_type = link.get("type", "related")
+        else:
+            continue
+        if target_id:
+            conn.execute("INSERT OR IGNORE INTO note_links VALUES (?, ?, ?)",
+                        (note_id, target_id, link_type))
+            link_target_ids.append(target_id)
+
+    # Rebuild anchor text for link targets
+    if link_target_ids:
+        _update_anchor_text_for(conn, link_target_ids)
+
+    # Anti-pattern fields
+    if is_anti_pattern:
+        for pat in (params.get("primitives_to_avoid") or []):
+            conn.execute("INSERT OR IGNORE INTO note_anti_patterns VALUES (?, ?)", (note_id, pat))
+        for alt in (params.get("preferred_alternatives") or []):
+            conn.execute("INSERT OR IGNORE INTO note_alternatives VALUES (?, ?)", (note_id, alt))
+
+    conn.commit()
+
+    # Generate embedding for the new note
+    if EMBEDDINGS_AVAILABLE and encode_text is not None:
+        cues_str = " ".join(params.get("cues") or [])
+        embed_text = f"{topic} {summary_text} {cues_str} {notes_body}"
+        vec_bytes = encode_text(embed_text)
+        if vec_bytes is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO note_embeddings (note_id, model, dimensions, vector) VALUES (?, ?, ?, ?)",
+                (note_id, MODEL_NAME, DIMENSIONS, vec_bytes),
+            )
+            conn.commit()
+            if invalidate_cache:
+                invalidate_cache()
+
+    # Auto-link to related notes via embedding similarity
+    if EMBEDDINGS_AVAILABLE and encode_text is not None:
+        try:
+            from embed import load_embedding_matrix, vector_search as _vs
+            cache = load_embedding_matrix(conn)
+            if cache:
+                note_ids_all, matrix = cache
+                cues_str = " ".join(params.get("cues") or [])
+                embed_text = f"{topic} {summary_text} {cues_str} {notes_body}"
+                similar = _vs(embed_text, note_ids_all, matrix, top_k=5)
+                auto_link_targets: list[str] = []
+                for sim_id, sim_score in similar:
+                    if sim_id != note_id and sim_score > 0.5:
+                        existing = conn.execute(
+                            "SELECT 1 FROM note_links WHERE source_id=? AND target_id=?",
+                            (note_id, sim_id)
+                        ).fetchone()
+                        if not existing:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO note_links (source_id, target_id, link_type) VALUES (?, ?, ?)",
+                                (note_id, sim_id, "related")
+                            )
+                            auto_link_targets.append(sim_id)
+                if auto_link_targets:
+                    _update_anchor_text_for(conn, auto_link_targets)
+                conn.commit()
+                if invalidate_cache:
+                    invalidate_cache()
+        except Exception:
+            pass  # Auto-linking is best-effort, never block note creation
+
+    # Update in-memory index
+    entry_data = load_note_dict(conn, note_id)
+    if entry_data:
+        update_entry(index, note_id, entry_data)
+
+    result: dict[str, Any] = {
+        "id":      note_id,
+        "path":    f"{library}/{note_id}.md",
+        "message": f"Created note '{note_id}'",
+    }
+    if warnings:
+        result["warnings"] = warnings
+    if suggested_links:
+        suggested_links.sort(key=lambda x: x["score"], reverse=True)
+        result["suggested_links"] = suggested_links[:5]
+    if unlinked:
+        result["unlinked_mentions"] = unlinked[:5]
+    return result
 
 
 def read_note(
@@ -213,27 +343,99 @@ def read_note(
             msg += f" Did you mean: {', '.join(candidates)}?"
         return {"error": msg}
 
-    entry    = index[note_id]
-    filepath = notemap_dir / entry["path"]
-
-    if not filepath.exists():
-        return {"error": f"File missing on disk: {filepath}"}
-
-    post = frontmatter.load(str(filepath))
+    conn = get_db(notemap_dir)
+    row = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
+    if not row:
+        return {"error": f"Note '{note_id}' not found in database."}
 
     if section == "meta":
-        return {"id": note_id, "section": "meta", "content": dict(post.metadata)}
+        # Build a meta dict from the DB row
+        meta = {
+            "id":                    row["id"],
+            "library":               row["library"],
+            "type":                  row["type"],
+            "topic":                 row["topic"],
+            "source_quality":        row["source_quality"],
+            "confidence":            row["confidence"],
+            "lifecycle":             row["lifecycle"],
+            "library_version":       row["library_version"],
+            "created":               row["created"],
+            "last_modified":         row["last_modified"],
+            "last_reviewed":         row["last_reviewed"],
+            "review_interval_days":  row["review_interval_days"],
+            "review_tier":           row["review_tier"],
+            "miss_count":            row["miss_count"],
+            "review_count":          row["review_count"],
+            "always_relevant":       bool(row["always_relevant"]),
+            "wrong_assumption":      row["wrong_assumption"],
+            "correct_behavior":      row["correct_behavior"],
+            "applies_to":            row["applies_to"],
+            "tags": [r["tag"] for r in conn.execute(
+                "SELECT tag FROM note_tags WHERE note_id = ?", (note_id,)).fetchall()],
+            "related_functions": [r["function_name"] for r in conn.execute(
+                "SELECT function_name FROM note_functions WHERE note_id = ?", (note_id,)).fetchall()],
+            "related_notes": [{"id": r["target_id"], "type": r["link_type"]} for r in conn.execute(
+                "SELECT target_id, link_type FROM note_links WHERE source_id = ?", (note_id,)).fetchall()],
+            "sources": json.loads(row["sources_json"] or "[]"),
+            "miss_log": json.loads(row["miss_log_json"] or "[]"),
+        }
+        return {"id": note_id, "section": "meta", "content": meta}
 
-    if section in ("cues", "notes", "summary"):
-        sections = _extract_sections(post.content)
-        return {"id": note_id, "section": section, "content": sections.get(section, "")}
+    if section == "cues":
+        return {"id": note_id, "section": "cues", "content": row["cues_raw"]}
+
+    if section == "notes":
+        return {"id": note_id, "section": "notes", "content": row["notes_body"]}
+
+    if section == "summary":
+        return {"id": note_id, "section": "summary", "content": row["summary"]}
 
     # section == "all"
+    # Build a full representation
+    tags = [r["tag"] for r in conn.execute(
+        "SELECT tag FROM note_tags WHERE note_id = ?", (note_id,)).fetchall()]
+    related_functions = [r["function_name"] for r in conn.execute(
+        "SELECT function_name FROM note_functions WHERE note_id = ?", (note_id,)).fetchall()]
+    related_notes_list = [{"id": r["target_id"], "type": r["link_type"]} for r in conn.execute(
+        "SELECT target_id, link_type FROM note_links WHERE source_id = ?", (note_id,)).fetchall()]
+
+    frontmatter = {
+        "id":                    row["id"],
+        "library":               row["library"],
+        "type":                  row["type"],
+        "topic":                 row["topic"],
+        "tags":                  tags,
+        "source_quality":        row["source_quality"],
+        "confidence":            row["confidence"],
+        "lifecycle":             row["lifecycle"],
+        "library_version":       row["library_version"],
+        "created":               row["created"],
+        "last_modified":         row["last_modified"],
+        "last_reviewed":         row["last_reviewed"],
+        "review_interval_days":  row["review_interval_days"],
+        "review_tier":           row["review_tier"],
+        "miss_count":            row["miss_count"],
+        "miss_log":              json.loads(row["miss_log_json"] or "[]"),
+        "review_count":          row["review_count"],
+        "related_functions":     related_functions,
+        "related_notes":         related_notes_list,
+        "sources":               json.loads(row["sources_json"] or "[]"),
+        "always_relevant":       bool(row["always_relevant"]),
+        "wrong_assumption":      row["wrong_assumption"],
+        "correct_behavior":      row["correct_behavior"],
+        "applies_to":            row["applies_to"],
+    }
+
+    # Reconstruct a body similar to the old markdown format
+    cues_section = row["cues_raw"]
+    cue_lines = "\n".join(f"- {c}" for c in cues_section.split("\n") if c.strip()) if cues_section else ""
+    body = f"## Cues\n{cue_lines}\n\n## Notes\n{row['notes_body']}\n\n## Summary\n{row['summary']}\n"
+
     return {
         "id":          note_id,
         "section":     "all",
-        "frontmatter": dict(post.metadata),
-        "body":        post.content,
+        "frontmatter": frontmatter,
+        "body":        body,
     }
 
 
@@ -244,169 +446,306 @@ def update_note(
 ) -> dict[str, Any]:
     """Update an existing note.
 
-    Accepts any combination of updatable fields.  Returns a result dict
-    with ``id``, ``changes`` (list of human-readable strings), and
-    ``message``.
+    Accepts any combination of updatable fields. Returns a result dict
+    with ``id``, ``changes``, and ``message``.
     """
     note_id: str = params["id"]
 
     if note_id not in index:
         return {"error": f"Note '{note_id}' not found."}
 
-    entry    = index[note_id]
-    filepath = notemap_dir / entry["path"]
+    conn = get_db(notemap_dir)
+    row = conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
+    if not row:
+        return {"error": f"Note '{note_id}' not found in database."}
 
-    if not filepath.exists():
-        return {"error": f"File missing on disk: {filepath}"}
-
-    post     = frontmatter.load(str(filepath))
-    meta     = post.metadata
-    sections = _extract_sections(post.content)
     changes: list[str] = []
 
-    # ---- Simple scalar replacements ----
-    simple_fields = [
-        "source_quality",
-        "confidence",
-        "library_version",
-        "review_interval_days",
-        "wrong_assumption",
-        "correct_behavior",
-        "applies_to",
-    ]
-    for fld in simple_fields:
-        if fld in params:
-            old_val = meta.get(fld)
-            meta[fld] = params[fld]
-            changes.append(f"{fld}: {old_val!r} -> {params[fld]!r}")
+    # ---- Reclassification (library change) ----
+    if "new_library" in params:
+        new_lib = params["new_library"].strip()
+        old_lib = row["library"]
+        if new_lib and new_lib != old_lib:
+            conn.execute("UPDATE notes SET library = ? WHERE id = ?", (new_lib, note_id))
+            changes.append(f"library: reclassified from '{old_lib}' to '{new_lib}'")
 
-    # ---- Summary (also a simple replacement but lives in body) ----
+    # ---- Simple scalar replacements ----
+    simple_fields = {
+        "type":                  "type",
+        "source_quality":        "source_quality",
+        "confidence":            "confidence",
+        "library_version":       "library_version",
+        "review_interval_days":  "review_interval_days",
+        "wrong_assumption":      "wrong_assumption",
+        "correct_behavior":      "correct_behavior",
+        "applies_to":            "applies_to",
+    }
+    for param_fld, db_fld in simple_fields.items():
+        if param_fld in params:
+            old_val = row[db_fld]
+            new_val = params[param_fld]
+            conn.execute(f"UPDATE notes SET {db_fld} = ? WHERE id = ?", (new_val, note_id))
+            changes.append(f"{param_fld}: {old_val!r} -> {new_val!r}")
+
+    # ---- Summary ----
     if "summary" in params:
-        sections["summary"] = params["summary"]
+        conn.execute("UPDATE notes SET summary = ? WHERE id = ?", (params["summary"], note_id))
         changes.append("summary: replaced")
 
-    # ---- List add/remove fields ----
-    list_fields = [
-        "cues",
-        "tags",
-        "related_functions",
-        "related_notes",
-        "primitives_to_avoid",
-        "preferred_alternatives",
-    ]
-    for fld in list_fields:
-        if fld not in params:
-            continue
-        spec = params[fld]
-        to_add: list[str]    = spec.get("add", []) if isinstance(spec, dict) else []
-        to_remove: list[str] = spec.get("remove", []) if isinstance(spec, dict) else []
+    # ---- Notes body: full replacement ----
+    if "notes" in params:
+        new_body = params["notes"]
+        # Also update notes_body_search
+        topic = row["topic"]
+        library = row["library"]
+        context_prefix = "This note is about %s in %s" % (topic, library)
+        search_body = (context_prefix + ". " + new_body)[:500]
+        conn.execute("UPDATE notes SET notes_body = ?, notes_body_search = ? WHERE id = ?",
+                     (new_body, search_body, note_id))
+        changes.append("notes: replaced")
 
-        if fld == "cues":
-            # Cues live in the body, not frontmatter
-            current = _cues_from_section(sections.get("cues", ""))
-        else:
-            current = list(meta.get(fld, []))
+    # ---- Notes body: append ----
+    if "notes_append" in params:
+        existing_body = row["notes_body"]
+        separator = "\n\n" if existing_body else ""
+        new_body = existing_body + separator + params["notes_append"]
+        topic = row["topic"]
+        library = row["library"]
+        context_prefix = "This note is about %s in %s" % (topic, library)
+        search_body = (context_prefix + ". " + new_body)[:500]
+        conn.execute("UPDATE notes SET notes_body = ?, notes_body_search = ? WHERE id = ?",
+                     (new_body, search_body, note_id))
+        changes.append("notes: appended")
 
-        added   = [v for v in to_add if v not in current]
-        removed = [v for v in to_remove if v in current]
+    # ---- Cues (add/remove) ----
+    if "cues" in params:
+        spec = params["cues"]
+        current_cues = [c.strip() for c in (row["cues_raw"] or "").split("\n") if c.strip()]
+        to_add = spec.get("add", []) if isinstance(spec, dict) else []
+        to_remove = spec.get("remove", []) if isinstance(spec, dict) else []
+        added = [v for v in to_add if v not in current_cues]
+        removed = [v for v in to_remove if v in current_cues]
         for v in added:
-            current.append(v)
+            current_cues.append(v)
         for v in removed:
-            current.remove(v)
-
-        if fld == "cues":
-            sections["cues"] = "\n".join(f"- {c}" for c in current) if current else ""
-        else:
-            meta[fld] = current
-
+            current_cues.remove(v)
+        conn.execute("UPDATE notes SET cues_raw = ? WHERE id = ?",
+                     ("\n".join(current_cues), note_id))
         if added:
-            changes.append(f"{fld}: added {added}")
+            changes.append(f"cues: added {added}")
         if removed:
-            changes.append(f"{fld}: removed {removed}")
+            changes.append(f"cues: removed {removed}")
+
+    # ---- List add/remove for related tables ----
+    list_field_handlers = {
+        "tags": ("note_tags", "tag", "note_id"),
+        "related_functions": ("note_functions", "function_name", "note_id"),
+        "primitives_to_avoid": ("note_anti_patterns", "primitive_to_avoid", "note_id"),
+        "preferred_alternatives": ("note_alternatives", "alternative", "note_id"),
+    }
+
+    for param_fld, (table, val_col, id_col) in list_field_handlers.items():
+        if param_fld not in params:
+            continue
+        spec = params[param_fld]
+        to_add = spec.get("add", []) if isinstance(spec, dict) else []
+        to_remove = spec.get("remove", []) if isinstance(spec, dict) else []
+
+        for v in to_add:
+            conn.execute(f"INSERT OR IGNORE INTO {table} ({id_col}, {val_col}) VALUES (?, ?)",
+                        (note_id, v))
+        for v in to_remove:
+            conn.execute(f"DELETE FROM {table} WHERE {id_col} = ? AND {val_col} = ?",
+                        (note_id, v))
+
+        added = to_add if to_add else []
+        removed = to_remove if to_remove else []
+        if added:
+            changes.append(f"{param_fld}: added {added}")
+        if removed:
+            changes.append(f"{param_fld}: removed {removed}")
+
+        # Keep tags_text column in sync for FTS5 indexing
+        if param_fld == "tags" and (added or removed):
+            current_tags = [r["tag"] for r in conn.execute(
+                "SELECT tag FROM note_tags WHERE note_id = ?", (note_id,)).fetchall()]
+            conn.execute("UPDATE notes SET tags_text = ? WHERE id = ?",
+                         (" ".join(current_tags), note_id))
+
+    # ---- Related notes (add/remove typed links) ----
+    if "related_notes" in params:
+        spec = params["related_notes"]
+        to_add = spec.get("add", []) if isinstance(spec, dict) else []
+        to_remove = spec.get("remove", []) if isinstance(spec, dict) else []
+
+        affected_targets: list[str] = []
+        for v in to_add:
+            if isinstance(v, str):
+                conn.execute("INSERT OR IGNORE INTO note_links VALUES (?, ?, ?)",
+                            (note_id, v, "related"))
+                affected_targets.append(v)
+            elif isinstance(v, dict):
+                tid = v.get("id", "")
+                conn.execute("INSERT OR IGNORE INTO note_links VALUES (?, ?, ?)",
+                            (note_id, tid, v.get("type", "related")))
+                if tid:
+                    affected_targets.append(tid)
+        for v in to_remove:
+            target = v if isinstance(v, str) else v.get("id", "") if isinstance(v, dict) else ""
+            if target:
+                conn.execute("DELETE FROM note_links WHERE source_id = ? AND target_id = ?",
+                            (note_id, target))
+                affected_targets.append(target)
+
+        # Rebuild anchor text for affected link targets
+        if affected_targets:
+            _update_anchor_text_for(conn, affected_targets)
+
+        if to_add:
+            changes.append(f"related_notes: added {to_add}")
+        if to_remove:
+            changes.append(f"related_notes: removed {to_remove}")
 
     # ---- Sources: full replacement ----
     if "sources" in params:
-        meta["sources"] = params["sources"]
+        conn.execute("UPDATE notes SET sources_json = ? WHERE id = ?",
+                     (json.dumps(params["sources"]), note_id))
         changes.append(f"sources: set to {len(params['sources'])} source(s)")
-
-    # ---- Notes: full replacement ----
-    if "notes" in params:
-        sections["notes"] = params["notes"]
-        changes.append("notes: replaced")
-
-    # ---- Notes: append ----
-    if "notes_append" in params:
-        existing = sections.get("notes") or ""
-        separator = "\n\n" if existing else ""
-        sections["notes"] = existing + separator + params["notes_append"]
-        changes.append("notes: appended")
 
     # ---- mark_reviewed ----
     if params.get("mark_reviewed"):
         today = today_str()
-        meta["last_reviewed"] = today
-        meta["review_count"]  = meta.get("review_count", 0) + 1
-        changes.append(f"last_reviewed: {today}, review_count: {meta['review_count']}")
+        review_count = row["review_count"] + 1
 
-        # Extend interval if no misses and reviewed enough
-        if meta.get("miss_count", 0) == 0 and meta["review_count"] >= 3:
-            current_interval = meta.get("review_interval_days", 30)
-            if current_interval < 60:
-                meta["review_interval_days"] = 60
-                changes.append("review_interval_days: 30 -> 60")
-            elif current_interval < 90:
-                meta["review_interval_days"] = 90
-                changes.append("review_interval_days: 60 -> 90")
+        # Tier-based interval system
+        _TIER_INTERVALS = {1: 14, 2: 30, 3: 60, 4: 120, 5: 365}
+        current_tier = row["review_tier"] or 2
+        miss_count = row["miss_count"]
+
+        # Promote to next tier if no misses, reviewed enough, AND enough time has elapsed.
+        # Time gate: at least 50% of the current tier interval must have passed since last_reviewed
+        # to prevent racing to Tier 5 in a single session.
+        if miss_count == 0 and review_count >= 2:
+            elapsed_ok = True
+            last_reviewed_str = row["last_reviewed"] or ""
+            if last_reviewed_str:
+                from datetime import date
+                try:
+                    last_reviewed_date = date.fromisoformat(last_reviewed_str)
+                    days_elapsed = (date.fromisoformat(today) - last_reviewed_date).days
+                    min_days = _TIER_INTERVALS.get(current_tier, 30) // 2
+                    if days_elapsed < min_days:
+                        elapsed_ok = False
+                except (ValueError, TypeError):
+                    pass  # If date parsing fails, allow promotion
+            new_tier = min(current_tier + 1, 5)
+            if elapsed_ok and new_tier != current_tier:
+                current_tier = new_tier
+                changes.append(f"review_tier: {row['review_tier']} -> {new_tier}")
+
+        # Compute interval from tier with modifiers
+        base_interval = _TIER_INTERVALS.get(current_tier, 30)
+
+        conf = params.get("confidence") or row["confidence"]
+        conf_mod = {"strong": 1.3, "maybe": 1.0, "weak": 0.7}.get(conf, 1.0)
+
+        note_type = row["type"]
+        type_mod = {
+            "anti-pattern": 0.8, "correction": 0.8,
+            "knowledge": 1.0, "technique": 1.0,
+            "convention": 1.2, "reference": 1.2,
+            "decision": 1.3, "finding": 1.0,
+        }.get(note_type, 1.0)
+
+        miss_mod = 0.8 ** miss_count if miss_count > 0 else 1.0
+
+        import random
+        fuzz = random.uniform(0.95, 1.05)
+
+        computed_interval = int(base_interval * conf_mod * type_mod * miss_mod * fuzz)
+        computed_interval = max(7, computed_interval)
+
+        lifecycle = row["lifecycle"]
+        extra_updates = ""
+        extra_params: list[Any] = []
 
         # Reset stale notes back to active
-        if meta.get("lifecycle") == Lifecycle.STALE.value:
-            meta["lifecycle"]     = Lifecycle.ACTIVE.value
-            meta["miss_count"]    = 0
-            meta["review_count"]  = 0
+        if lifecycle == Lifecycle.STALE.value:
+            extra_updates = ", lifecycle = ?, miss_count = 0, review_count = 0"
+            extra_params = [Lifecycle.ACTIVE.value]
+            review_count = 0
             changes.append("lifecycle: stale -> active (reset miss_count and review_count)")
+
+        conn.execute(
+            f"UPDATE notes SET last_reviewed = ?, review_count = ?, review_tier = ?, review_interval_days = ?{extra_updates} WHERE id = ?",
+            [today, review_count, current_tier, computed_interval] + extra_params + [note_id]
+        )
+        changes.append(f"last_reviewed: {today}, review_count: {review_count}")
+        changes.append(f"review_interval_days: {computed_interval} (tier {current_tier})")
 
     # ---- increment_miss ----
     if params.get("increment_miss"):
         reason = params.get("miss_reason", "unclassified")
         today  = today_str()
 
-        meta["miss_count"] = meta.get("miss_count", 0) + 1
-        miss_log: list[dict[str, str]] = meta.get("miss_log", [])
+        new_miss_count = row["miss_count"] + 1
+        miss_log = json.loads(row["miss_log_json"] or "[]")
         miss_log.append({"date": today, "reason": reason})
-        meta["miss_log"] = miss_log
-        changes.append(f"miss_count: {meta['miss_count']}, miss_log: +{{date: {today}, reason: {reason}}}")
 
-        # Adjust review interval based on miss count
-        mc = meta["miss_count"]
-        if mc >= 3:
-            meta["review_interval_days"] = 14
-            meta["lifecycle"] = Lifecycle.STALE.value
-            changes.append("review_interval_days: -> 14, lifecycle: -> stale")
-        elif mc >= 2:
-            meta["review_interval_days"] = 14
-            changes.append("review_interval_days: -> 14")
-        elif mc == 1:
-            meta["review_interval_days"] = 30
-            changes.append("review_interval_days: -> 30")
+        _TIER_INTERVALS = {1: 14, 2: 30, 3: 60, 4: 120, 5: 365}
+        current_tier = row["review_tier"] or 2
+
+        if new_miss_count >= 3:
+            conn.execute("""
+                UPDATE notes SET miss_count = ?, miss_log_json = ?,
+                    review_tier = 1, review_interval_days = 14, lifecycle = ?
+                WHERE id = ?
+            """, (new_miss_count, json.dumps(miss_log), Lifecycle.STALE.value, note_id))
+            changes.append(f"miss_count: {new_miss_count}, review_tier: -> 1, lifecycle: -> stale")
+        elif new_miss_count >= 2:
+            new_tier = max(current_tier - 1, 1)
+            interval = _TIER_INTERVALS.get(new_tier, 14)
+            conn.execute("""
+                UPDATE notes SET miss_count = ?, miss_log_json = ?,
+                    review_tier = ?, review_interval_days = ?
+                WHERE id = ?
+            """, (new_miss_count, json.dumps(miss_log), new_tier, interval, note_id))
+            changes.append(f"miss_count: {new_miss_count}, review_tier: -> {new_tier}")
+        else:
+            conn.execute("""
+                UPDATE notes SET miss_count = ?, miss_log_json = ?,
+                    review_interval_days = 30
+                WHERE id = ?
+            """, (new_miss_count, json.dumps(miss_log), note_id))
+            changes.append(f"miss_count: {new_miss_count}, review_interval_days: -> 30")
 
     # ---- Always update last_modified ----
-    meta["last_modified"] = today_str()
+    conn.execute("UPDATE notes SET last_modified = ? WHERE id = ?", (today_str(), note_id))
 
-    # ---- Rebuild and write ----
-    cues_list = _cues_from_section(sections.get("cues", ""))
-    body      = _build_body(cues_list, sections.get("notes", ""), sections.get("summary", ""))
-    post.content  = body
-    post.metadata = meta
+    conn.commit()
 
-    filepath.write_text(frontmatter.dumps(post), encoding="utf-8")
+    # Re-embed if content changed
+    content_changed = any(k in params for k in ("notes", "notes_append", "summary"))
+    if content_changed and EMBEDDINGS_AVAILABLE and encode_text is not None:
+        updated_row = conn.execute(
+            "SELECT topic, summary, notes_body FROM notes WHERE id = ?", (note_id,)
+        ).fetchone()
+        if updated_row:
+            embed_text = f"{updated_row[0]} {updated_row[1]} {updated_row[2]}"
+            vec_bytes = encode_text(embed_text)
+            if vec_bytes is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO note_embeddings (note_id, model, dimensions, vector) VALUES (?, ?, ?, ?)",
+                    (note_id, MODEL_NAME, DIMENSIONS, vec_bytes),
+                )
+                conn.commit()
+                if invalidate_cache:
+                    invalidate_cache()
 
-    # ---- Update index ----
-    entry_data = dict(meta)
-    entry_data["cues"]    = cues_list
-    entry_data["summary"] = sections.get("summary", "")
-    entry_data["path"]    = str(filepath.resolve())
-    update_entry(index, note_id, entry_data)
-    save_index(notemap_dir, index)
+    # Reload from DB into in-memory index
+    entry_data = load_note_dict(conn, note_id)
+    if entry_data:
+        update_entry(index, note_id, entry_data)
 
     return {
         "id":      note_id,
@@ -422,8 +761,7 @@ def delete_note(
 ) -> dict[str, Any]:
     """Delete (soft or hard) a note.
 
-    Soft delete moves the file to ``_archive/`` and cleans up references.
-    Hard delete removes the file permanently.
+    Soft delete sets lifecycle to 'archived'. Hard delete removes from DB.
     """
     note_id: str     = params["id"]
     reason: str      = params.get("reason", "")
@@ -432,60 +770,31 @@ def delete_note(
     if note_id not in index:
         return {"error": f"Note '{note_id}' not found."}
 
-    entry    = index[note_id]
-    filepath = notemap_dir / entry["path"]
+    conn = get_db(notemap_dir)
 
     if hard_delete:
-        # Permanent deletion
-        if filepath.exists():
-            filepath.unlink()
+        conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+        conn.commit()
+        if invalidate_cache:
+            invalidate_cache()
         remove_entry(index, note_id)
-        save_index(notemap_dir, index)
         return {
             "id":      note_id,
             "action":  "hard_delete",
             "message": f"Permanently deleted note '{note_id}'",
         }
 
-    # ---- Soft delete ----
-
-    # Load and stamp with archive metadata
-    if filepath.exists():
-        post = frontmatter.load(str(filepath))
-        post.metadata["archive_reason"] = reason
-        post.metadata["archived_date"]  = today_str()
-
-        # Move to _archive
-        archive_dir = notemap_dir / "_archive"
-        ensure_dir(archive_dir)
-        archive_path = archive_dir / f"{note_id}.md"
-        archive_path.write_text(frontmatter.dumps(post), encoding="utf-8")
-
-        # Remove original
-        filepath.unlink()
+    # Soft delete: mark as archived
+    conn.execute("UPDATE notes SET lifecycle = 'archived', last_modified = ? WHERE id = ?",
+                 (today_str(), note_id))
 
     # Clean up related_notes references in other notes
-    for other_id, other_entry in list(index.items()):
-        if other_id == note_id:
-            continue
-        related: list[str] = other_entry.get("related_notes") or []
-        if note_id in related:
-            other_path = Path(other_entry["path"])
-            if other_path.exists():
-                other_post = frontmatter.load(str(other_path))
-                other_related = list(other_post.metadata.get("related_notes", []))
-                if note_id in other_related:
-                    other_related.remove(note_id)
-                    other_post.metadata["related_notes"] = other_related
-                    other_path.write_text(
-                        frontmatter.dumps(other_post), encoding="utf-8"
-                    )
-            other_entry["related_notes"] = [
-                r for r in related if r != note_id
-            ]
+    conn.execute("DELETE FROM note_links WHERE target_id = ?", (note_id,))
 
+    conn.commit()
+    if invalidate_cache:
+        invalidate_cache()
     remove_entry(index, note_id)
-    save_index(notemap_dir, index)
 
     return {
         "id":      note_id,

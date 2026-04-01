@@ -21,6 +21,9 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src" / "notemap-mcp")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
+from datetime import date, timedelta
+
+from db import close_db, get_db, load_note_dict
 from index import load_or_rebuild_index, save_index
 from notes import create_note, update_note
 from utils import today_str
@@ -57,6 +60,7 @@ class TestIntervals(unittest.TestCase):
         self.index: dict = load_or_rebuild_index(self.tmp_dir)
 
     def tearDown(self) -> None:
+        close_db()
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     # -- Convenience --------------------------------------------------------
@@ -71,6 +75,18 @@ class TestIntervals(unittest.TestCase):
     def _entry(self, note_id: str) -> dict:
         """Return the current index entry for *note_id*."""
         return self.index[note_id]
+
+    def _backdate(self, note_id: str, days_ago: int) -> None:
+        """Set last_reviewed to *days_ago* days in the past (DB + index).
+
+        This satisfies the time-gate requirement for tier promotion tests.
+        """
+        past = (date.today() - timedelta(days=days_ago)).isoformat()
+        conn = get_db(self.tmp_dir)
+        conn.execute("UPDATE notes SET last_reviewed = ? WHERE id = ?", (past, note_id))
+        conn.commit()
+        if note_id in self.index:
+            self.index[note_id]["last_reviewed"] = past
 
     # -- miss_count=1 resets interval to 30 ---------------------------------
 
@@ -125,17 +141,56 @@ class TestIntervals(unittest.TestCase):
     # -- miss_count=0 AND review_count>=3 extends interval ------------------
 
     def test_review_extends_interval_30_to_60(self) -> None:
+        """Tier promotion from 2 (30d) to 3 (60d) after enough reviews."""
         note_id = self._create("Interval extension 30->60")
 
-        # Reviews 1-2: no change to interval
-        for _ in range(2):
-            update_note(self.index, self.tmp_dir, {
-                "id":            note_id,
-                "mark_reviewed": True,
-            })
-        self.assertEqual(self._entry(note_id)["review_interval_days"], 30)
+        # Review 1: no promotion yet (review_count=1, need >=2)
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+        self.assertEqual(self._entry(note_id).get("review_tier", 2), 2)
 
-        # Review 3: triggers extension 30 -> 60
+        # Backdate so time gate (50% of 30d = 15d) is satisfied
+        self._backdate(note_id, 16)
+
+        # Review 2: triggers promotion from tier 2 -> 3
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+
+        entry = self._entry(note_id)
+        self.assertEqual(entry["review_count"], 2)
+        self.assertEqual(entry.get("review_tier"), 3)
+        # With fuzz and confidence=strong (1.3), type=knowledge (1.0):
+        # base=60, range ~ 60*1.3*0.95 to 60*1.3*1.05 = 74..81
+        self.assertGreaterEqual(entry["review_interval_days"], 70)
+        self.assertLessEqual(entry["review_interval_days"], 85)
+
+    def test_review_extends_interval_to_tier_4(self) -> None:
+        """Tier promotion from 3 (60d) to 4 (120d)."""
+        note_id = self._create("Interval extension to tier 4")
+
+        # Review 1
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+        # Backdate past tier 2 gate (50% of 30d = 15d)
+        self._backdate(note_id, 16)
+
+        # Review 2: promote tier 2 -> 3
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+        self.assertEqual(self._entry(note_id).get("review_tier"), 3)
+
+        # Backdate past tier 3 gate (50% of 60d = 30d)
+        self._backdate(note_id, 31)
+
+        # Review 3: promote tier 3 -> 4
         update_note(self.index, self.tmp_dir, {
             "id":            note_id,
             "mark_reviewed": True,
@@ -143,47 +198,42 @@ class TestIntervals(unittest.TestCase):
 
         entry = self._entry(note_id)
         self.assertEqual(entry["review_count"], 3)
-        self.assertEqual(entry["review_interval_days"], 60)
+        self.assertEqual(entry.get("review_tier"), 4)
+        # base=120, strong conf=1.3, fuzz 0.95-1.05: range ~148..163
+        self.assertGreaterEqual(entry["review_interval_days"], 140)
+        self.assertLessEqual(entry["review_interval_days"], 170)
 
-    def test_review_extends_interval_60_to_90(self) -> None:
-        note_id = self._create("Interval extension 60->90")
+    def test_review_tier_caps_at_5(self) -> None:
+        """Tier 5 (365d) is the maximum - further reviews stay at tier 5."""
+        note_id = self._create("Tier cap at 5")
+        tier_gates = [16, 31, 61, 121]  # 50% of tier 2/3/4/5 intervals
 
-        # Get to review_count=3, interval=60
-        for _ in range(3):
+        # Push through tiers: 2->3->4->5
+        for i in range(4):
             update_note(self.index, self.tmp_dir, {
                 "id":            note_id,
                 "mark_reviewed": True,
             })
-        self.assertEqual(self._entry(note_id)["review_interval_days"], 60)
+            if i < len(tier_gates):
+                self._backdate(note_id, tier_gates[i])
 
-        # Review 4: interval stays at 60 (needs to reach next threshold)
-        # The code checks `current_interval < 90` so 60 -> 90 on review 4
+        # Final promotion review
         update_note(self.index, self.tmp_dir, {
             "id":            note_id,
             "mark_reviewed": True,
         })
+        self.assertEqual(self._entry(note_id).get("review_tier"), 5)
 
-        entry = self._entry(note_id)
-        self.assertEqual(entry["review_count"], 4)
-        self.assertEqual(entry["review_interval_days"], 90)
-
-    def test_review_interval_caps_at_90(self) -> None:
-        note_id = self._create("Interval cap at 90")
-
-        # Push through 5 reviews to get to 90
-        for _ in range(5):
-            update_note(self.index, self.tmp_dir, {
-                "id":            note_id,
-                "mark_reviewed": True,
-            })
-        self.assertEqual(self._entry(note_id)["review_interval_days"], 90)
-
-        # One more review: should stay at 90
+        # One more review: should stay at tier 5
+        self._backdate(note_id, 183)
         update_note(self.index, self.tmp_dir, {
             "id":            note_id,
             "mark_reviewed": True,
         })
-        self.assertEqual(self._entry(note_id)["review_interval_days"], 90)
+        self.assertEqual(self._entry(note_id).get("review_tier"), 5)
+        # base=365, strong conf=1.3, fuzz 0.95-1.05: range ~450..498
+        self.assertGreaterEqual(self._entry(note_id)["review_interval_days"], 440)
+        self.assertLessEqual(self._entry(note_id)["review_interval_days"], 510)
 
     # -- Stale note re-verified resets everything ---------------------------
 
@@ -283,8 +333,8 @@ class TestIntervals(unittest.TestCase):
 
     # -- Interval not extended when misses exist ----------------------------
 
-    def test_no_interval_extension_with_misses(self) -> None:
-        """Even with 3+ reviews, interval should NOT extend if miss_count > 0."""
+    def test_no_tier_promotion_with_misses(self) -> None:
+        """Even with 3+ reviews, tier should NOT promote if miss_count > 0."""
         note_id = self._create("No extension with misses")
 
         # One miss first
@@ -301,15 +351,17 @@ class TestIntervals(unittest.TestCase):
             })
 
         entry = self._entry(note_id)
-        # miss_count is 1, so interval should be 30 (from miss), not 60
-        self.assertEqual(entry["review_interval_days"], 30)
+        # miss_count is 1, so tier should stay at 2 (no promotion)
+        self.assertEqual(entry.get("review_tier", 2), 2)
+        # Interval should remain around tier 2 base with miss penalty
+        # base=30, conf=1.3, miss_mod=0.8, fuzz 0.95-1.05: range ~29-33
+        self.assertGreaterEqual(entry["review_interval_days"], 28)
+        self.assertLessEqual(entry["review_interval_days"], 35)
 
     # -- File on disk reflects changes --------------------------------------
 
-    def test_changes_persisted_to_file(self) -> None:
-        """Verify the .md file on disk has the updated frontmatter."""
-        import frontmatter
-
+    def test_changes_persisted_to_db(self) -> None:
+        """Verify the SQLite database has the updated fields."""
         note_id = self._create("Persistence check")
 
         # Drive to 3 misses (stale)
@@ -325,16 +377,16 @@ class TestIntervals(unittest.TestCase):
             "mark_reviewed": True,
         })
 
-        # Read the file directly
-        entry = self._entry(note_id)
-        filepath = Path(entry["path"])
-        if not filepath.is_absolute():
-            filepath = self.tmp_dir / entry["path"]
-        post = frontmatter.load(str(filepath))
+        # Read from DB directly
+        conn = get_db(self.tmp_dir)
+        row = conn.execute(
+            "SELECT lifecycle, miss_count, review_count FROM notes WHERE id = ?",
+            (note_id,),
+        ).fetchone()
 
-        self.assertEqual(post.metadata["lifecycle"], "active")
-        self.assertEqual(post.metadata["miss_count"], 0)
-        self.assertEqual(post.metadata["review_count"], 0)
+        self.assertEqual(row["lifecycle"], "active")
+        self.assertEqual(row["miss_count"], 0)
+        self.assertEqual(row["review_count"], 0)
 
     # -- Index on disk matches in-memory after interval changes -------------
 
@@ -357,6 +409,241 @@ class TestIntervals(unittest.TestCase):
             disk_entry["review_interval_days"],
             mem_entry["review_interval_days"],
         )
+
+
+    # -- Tier 5 promotion ------------------------------------------------
+
+    def test_review_tier_promotes_to_5(self) -> None:
+        """Verify full tier progression 2->3->4->5 with time gates."""
+        note_id = self._create("Full tier progression")
+        # Tier intervals: {2: 30, 3: 60, 4: 120, 5: 365}
+        # Time gates (50%): 15, 30, 60, 183
+
+        # Review 1 (no promotion, just sets review_count=1)
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+
+        # Backdate + review to promote 2->3
+        self._backdate(note_id, 16)
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+        self.assertEqual(self._entry(note_id).get("review_tier"), 3)
+
+        # Backdate + review to promote 3->4
+        self._backdate(note_id, 31)
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+        self.assertEqual(self._entry(note_id).get("review_tier"), 4)
+
+        # Backdate + review to promote 4->5
+        self._backdate(note_id, 61)
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+
+        entry = self._entry(note_id)
+        self.assertEqual(entry.get("review_tier"), 5)
+        # base=365, strong conf=1.3: ~450-498
+        self.assertGreaterEqual(entry["review_interval_days"], 440)
+
+    # -- Miss demotes tier -----------------------------------------------
+
+    def test_miss_demotes_tier(self) -> None:
+        """Verify tier demotion on miss_count >= 2."""
+        note_id = self._create("Tier demotion test")
+
+        # Promote to tier 3 first (review 1, backdate, review 2)
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+        self._backdate(note_id, 16)
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+        self.assertEqual(self._entry(note_id).get("review_tier"), 3)
+
+        # First miss: interval goes to 30, tier unchanged
+        update_note(self.index, self.tmp_dir, {
+            "id":             note_id,
+            "increment_miss": True,
+        })
+        self.assertEqual(self._entry(note_id).get("review_tier"), 3)
+        self.assertEqual(self._entry(note_id)["review_interval_days"], 30)
+
+        # Second miss: tier demotes from 3 to 2
+        update_note(self.index, self.tmp_dir, {
+            "id":             note_id,
+            "increment_miss": True,
+        })
+        entry = self._entry(note_id)
+        self.assertEqual(entry.get("review_tier"), 2)
+        self.assertEqual(entry["review_interval_days"], 30)
+
+    # -- Fuzz factor varies interval -------------------------------------
+
+    def test_fuzz_factor_varies_interval(self) -> None:
+        """Verify interval isn't always exactly the base (fuzz adds variance)."""
+        intervals = []
+        for i in range(10):
+            idx = load_or_rebuild_index(self.tmp_dir)
+            self.index = idx
+            nid = self._create(f"Fuzz test {i}")
+            update_note(self.index, self.tmp_dir, {
+                "id":            nid,
+                "mark_reviewed": True,
+            })
+            intervals.append(self._entry(nid)["review_interval_days"])
+
+        # With fuzz, not all 10 should be identical
+        unique = set(intervals)
+        # It's theoretically possible but astronomically unlikely for all to match
+        self.assertGreater(len(unique), 1, f"Expected variance in intervals, got: {intervals}")
+
+    # -- Confidence modifier affects interval ----------------------------
+
+    def test_confidence_modifier_affects_interval(self) -> None:
+        """Strong confidence should produce longer intervals than weak."""
+        nid_strong = self._create("Conf strong test", confidence="strong")
+        nid_weak = self._create("Conf weak test", confidence="weak")
+
+        # Both at tier 2, first review
+        update_note(self.index, self.tmp_dir, {
+            "id":            nid_strong,
+            "mark_reviewed": True,
+        })
+        update_note(self.index, self.tmp_dir, {
+            "id":            nid_weak,
+            "mark_reviewed": True,
+        })
+
+        strong_interval = self._entry(nid_strong)["review_interval_days"]
+        weak_interval = self._entry(nid_weak)["review_interval_days"]
+
+        # strong (1.3x) should be notably higher than weak (0.7x)
+        self.assertGreater(strong_interval, weak_interval)
+
+    # -- Type modifier: anti-pattern shorter interval --------------------
+
+    def test_type_modifier_anti_pattern_shorter(self) -> None:
+        """Anti-pattern notes should get shorter intervals than knowledge notes."""
+        nid_knowledge = self._create("Type knowledge test", type="knowledge")
+        nid_anti = self._create(
+            "Type anti-pattern test",
+            type="anti-pattern",
+            primitives_to_avoid=["bad_func"],
+            preferred_alternatives=["good_func"],
+        )
+
+        update_note(self.index, self.tmp_dir, {
+            "id":            nid_knowledge,
+            "mark_reviewed": True,
+        })
+        update_note(self.index, self.tmp_dir, {
+            "id":            nid_anti,
+            "mark_reviewed": True,
+        })
+
+        knowledge_interval = self._entry(nid_knowledge)["review_interval_days"]
+        anti_interval = self._entry(nid_anti)["review_interval_days"]
+
+        # anti-pattern (0.8x) should be shorter than knowledge (1.0x)
+        self.assertLess(anti_interval, knowledge_interval)
+
+    # -- Leech detection in audit ----------------------------------------
+
+    def test_leech_detection_in_audit(self) -> None:
+        """High miss ratio should be flagged as leech in audit."""
+        from audit import audit_notes
+
+        note_id = self._create("Leech detection test")
+
+        # One review
+        update_note(self.index, self.tmp_dir, {
+            "id":            note_id,
+            "mark_reviewed": True,
+        })
+
+        # Two misses -> miss_count=2, review_count=1 -> ratio=2.0 > 0.5
+        for _ in range(2):
+            update_note(self.index, self.tmp_dir, {
+                "id":             note_id,
+                "increment_miss": True,
+            })
+
+        result = audit_notes(self.index, self.tmp_dir, {"check": "leech"})
+        leech_items = result.get("leech", [])
+        leech_ids = [item["id"] for item in leech_items]
+        self.assertIn(note_id, leech_ids)
+        leech_entry = [item for item in leech_items if item["id"] == note_id][0]
+        self.assertGreater(leech_entry["miss_ratio"], 0.5)
+
+    # -- Confidence decay in audit ---------------------------------------
+
+    def test_confidence_decay_in_audit(self) -> None:
+        """Notes overdue for review should have confidence decay flagged."""
+        from audit import audit_notes, _check_confidence_decay
+        from datetime import date, timedelta
+
+        # Test the helper directly
+        entry = {
+            "confidence": "strong",
+            "review_interval_days": 30,
+            "last_reviewed": (date.today() - timedelta(days=61)).isoformat(),
+        }
+        result = _check_confidence_decay(entry, date.today())
+        self.assertEqual(result, "maybe")
+
+        # Test "maybe" -> "weak" decay
+        entry2 = {
+            "confidence": "maybe",
+            "review_interval_days": 30,
+            "last_reviewed": (date.today() - timedelta(days=91)).isoformat(),
+        }
+        result2 = _check_confidence_decay(entry2, date.today())
+        self.assertEqual(result2, "weak")
+
+        # No decay when within interval
+        entry3 = {
+            "confidence": "strong",
+            "review_interval_days": 30,
+            "last_reviewed": (date.today() - timedelta(days=30)).isoformat(),
+        }
+        result3 = _check_confidence_decay(entry3, date.today())
+        self.assertIsNone(result3)
+
+    # -- Review queue tier scoring ---------------------------------------
+
+    def test_review_queue_tier_scoring(self) -> None:
+        """Low-tier notes should score higher in the review queue."""
+        from audit import review_queue
+
+        nid = self._create("Queue tier test")
+        # Set to tier 1 manually via 3 misses
+        for _ in range(3):
+            update_note(self.index, self.tmp_dir, {
+                "id":             nid,
+                "increment_miss": True,
+            })
+
+        entry = self._entry(nid)
+        self.assertEqual(entry.get("review_tier"), 1)
+
+        result = review_queue(self.index, {})
+        queue = result.get("queue", [])
+        queue_entry = [item for item in queue if item["id"] == nid]
+        self.assertTrue(queue_entry, "Expected note in review queue")
+        reasons = queue_entry[0].get("reasons", [])
+        tier_reasons = [r for r in reasons if "tier 1" in r]
+        self.assertTrue(tier_reasons, f"Expected tier 1 scoring in reasons, got: {reasons}")
 
 
 if __name__ == "__main__":

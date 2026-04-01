@@ -21,12 +21,12 @@ There are two copies of the notemap files:
 
 | Directory | Purpose | Tracked |
 |-----------|---------|---------|
-| `src/notemap-mcp/` | Python MCP server (11 tools) | Yes |
+| `src/notemap-mcp/` | Python MCP server (14 tools) | Yes |
 | `src/commands/` | Slash command (`/notemap`) | Yes |
 | `src/skills/` | Skill file (`/notemap review`) | Yes |
 | `src/docs/` | Supplementary reference doc (`@docs/notemap.md`) | Yes |
 | `src/claude-md/` | CLAUDE.md integration content (instructions sentinel block) | Yes |
-| `src/hooks/` | Hook scripts (SessionStart, PreToolUse, PostToolUse) | Yes |
+| `src/hooks/` | Hook scripts (SessionStart, PostToolUse, UserPromptSubmit) | Yes |
 | `temp/` | Sandboxed test directory (created/destroyed by test_install_uninstall.sh) | No (gitignored) |
 
 ### Installed file manifest
@@ -41,22 +41,28 @@ There are two copies of the notemap files:
 | `preflight.py` | `~/.claude/notemap-mcp/` |
 | `check.py` | `~/.claude/notemap-mcp/` |
 | `index.py` | `~/.claude/notemap-mcp/` |
+| `db.py` | `~/.claude/notemap-mcp/` |
+| `graph.py` | `~/.claude/notemap-mcp/` |
+| `events.py` | `~/.claude/notemap-mcp/` |
 | `models.py` | `~/.claude/notemap-mcp/` |
 | `utils.py` | `~/.claude/notemap-mcp/` |
+| `embed.py` | `~/.claude/notemap-mcp/` |
+| `chunk.py` | `~/.claude/notemap-mcp/` |
+| `rag.py` | `~/.claude/notemap-mcp/` |
 | `requirements.txt` | `~/.claude/notemap-mcp/` |
 | `notemap.md` (command) | `~/.claude/commands/` |
 | `notemap-review.md` | `~/.claude/skills/` |
 | `notemap.md` (docs) | `~/.claude/docs/` |
 | `notemap-instructions.md` | Injected into `~/.claude/CLAUDE.md` via sentinels |
 | `session-start.sh` | `~/.claude/scripts/notemap/` |
-| `pre-edit.sh` | `~/.claude/scripts/notemap/` |
 | `post-edit.sh` | `~/.claude/scripts/notemap/` |
+| `user-prompt.sh` | `~/.claude/scripts/notemap/` |
 | MCP server entry | Merged into `~/.claude.json` |
 | Hook entries | Merged into `~/.claude/settings.json` |
 
 ### Note storage (user data, NOT distributed)
 
-`~/.claude/notemap/` contains the user's actual notes. This directory is created on first use and is never overwritten by the installer. The uninstaller preserves it by default.
+`~/.claude/notemap/notemap.db` is the SQLite database containing the user's notes. The directory is created on first use and the database is initialized automatically. The uninstaller preserves it by default.
 
 ## Development Workflow
 

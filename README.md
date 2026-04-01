@@ -2,7 +2,7 @@
 
 **Give Claude a persistent knowledge base so it remembers gotchas, patterns, and corrections across sessions.**
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.0.10-blue)
 [![CI](https://github.com/itoolsChristine/notemap/actions/workflows/ci.yml/badge.svg)](https://github.com/itoolsChristine/notemap/actions/workflows/ci.yml)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -23,7 +23,7 @@ notemap is a Cornell Note-Taking System adapted for AI coding assistants. It giv
 
 The system is built on Walter Pauk's Cornell method (from *How to Study in College*), adapted for an agent that has a 100% forgetting cliff at session end instead of a gradual human forgetting curve. Each note has three sections: **Notes** (the facts), **Cues** (self-test questions), and **Summary** (one-line distillation for fast scanning).
 
-An MCP server provides 11 tools for creating, searching, checking, and auditing notes -- all callable directly during Claude's coding sessions. The **preflight-then-check** workflow proactively surfaces gotchas before coding and catches anti-patterns after coding, without requiring Claude to know what to search for.
+An MCP server provides 14 tools for creating, searching, checking, and auditing notes -- all callable directly during Claude's coding sessions. The **preflight-then-check** workflow proactively surfaces gotchas before coding and catches anti-patterns after coding, without requiring Claude to know what to search for.
 
 ## Quick Install
 
@@ -59,15 +59,71 @@ install.cmd         # Windows CMD (or double-click)
 - Python 3.10+
 - pip (for installing MCP server dependencies)
 
+## Getting Started
+
+### What happens automatically
+
+After install, three hooks run in the background during every Claude Code session:
+
+- **Session start** -- reminds Claude to run `notemap_preflight` and load your notes
+- **Post-edit** -- reminds Claude to run `notemap_check` after writing code
+- **User prompt (RAG)** -- automatically searches your notes on every prompt and injects relevant context before Claude processes your message
+
+These hooks are registered in `~/.claude/settings.json` and can be adjusted or disabled there.
+
+### Your first session
+
+Once installed, start a Claude Code session and try:
+
+```
+notemap_stats()
+```
+
+This shows what's in your knowledge base (empty on first run). Then load any cross-cutting notes:
+
+```
+notemap_preflight(libraries=["_cross-cutting"])
+```
+
+Create your first note when you discover something worth remembering:
+
+```
+notemap_create(
+  library="myproject",
+  topic="config.load() silently returns empty dict on missing file",
+  type="anti-pattern",
+  notes="config.load() does not raise on missing files. Always check the return value.",
+  summary="config.load() returns empty dict on missing file, does not raise.",
+  cues=["What does config.load() do when the file is missing?"],
+  source_quality="runtime-tested",
+  confidence="strong"
+)
+```
+
+From here, notes surface automatically via the RAG hook and the preflight/check workflow.
+
+### Scanning a document for notes
+
+Use the `/notemap` command to scan a PDF or project:
+
+```
+/notemap scan pdf
+```
+
+Claude reads 20 pages at a time, ingests the raw text, and creates distilled notes for anything noteworthy. Notes persist across sessions and surface automatically via RAG whenever they're relevant to your prompt.
+
 ## How It Works
 
-### The 3 Core Rules
+### The Workflow
 
-Claude follows three simple rules (injected into CLAUDE.md):
+Claude follows a preflight-then-check workflow (injected into CLAUDE.md):
 
-1. **Before writing code, search notemap.** If the project uses libraries Claude has notes for, search first. Report what was found: `[notemap: zendb/2 notes, smartarray/0 notes]`.
-2. **When you learn something surprising, create a note.** Gotchas, wrong arguments, failed approaches, user corrections -- if it would cause a bug if forgotten, note it.
-3. **When a note is wrong, fix or delete it.** Wrong notes are worse than no notes.
+1. **Session start**: Run `notemap_stats()` to discover libraries, then `notemap_preflight()` to load all gotchas and anti-patterns for in-scope libraries.
+2. **Before every edit**: Search notemap for relevant functions and gotchas.
+3. **After every edit**: Run `notemap_check()` to auto-detect libraries and catch anti-patterns.
+4. **When you learn something**: Create a note with sources. Don't move on without capturing it.
+5. **When a note helped**: Mark it reviewed (strengthens its review tier).
+6. **When a note was wrong**: Fix it, or delete it if obsolete.
 
 ### The `/notemap` Command
 
@@ -79,21 +135,24 @@ Claude follows three simple rules (injected into CLAUDE.md):
 | `/notemap stats` | Show note counts by library |
 | `/notemap help` | Quick reference |
 
-### The 11 MCP Tools
+### The 14 MCP Tools
 
 | Tool | Purpose |
 |------|---------|
-| `notemap_preflight` | Load all notes for specified libraries at session start (anti-patterns first) |
+| `notemap_preflight` | Load all notes for specified libraries at session start (anti-patterns first). Supports `context_budget` for token-aware loading and `topic_focus` for semantic prioritization. |
 | `notemap_check` | Auto-detect libraries from code and check for anti-patterns + function gotchas |
-| `notemap_create` | Create a new note (knowledge, anti-pattern, correction, or convention) |
+| `notemap_create` | Create a new note (knowledge, anti-pattern, correction, or convention). Auto-generates embedding for semantic search. |
 | `notemap_read` | Read a specific note by ID |
-| `notemap_search` | Search notes by library, function name, keyword, or tag |
-| `notemap_update` | Update a note (fix content, upgrade confidence, record misses) |
+| `notemap_search` | Hybrid search: BM25F keyword matching + vector embedding similarity, merged via reciprocal rank fusion |
+| `notemap_update` | Update a note (fix content, upgrade confidence, record misses). Re-embeds on content change. |
 | `notemap_delete` | Soft-delete (archive) or hard-delete a note |
 | `notemap_audit` | Find stale, low-confidence, or problematic notes |
 | `notemap_review` | Get a prioritized review queue |
 | `notemap_lint` | Check code against anti-pattern notes (regex-based) |
-| `notemap_stats` | Overview of libraries, note counts, and health |
+| `notemap_stats` | Overview of libraries, note counts, health, and embedding status |
+| `notemap_connections` | Query the knowledge graph for connections, paths, and suggestions |
+| `notemap_embed` | Generate embeddings for all notes (batch). Use after bulk import or model upgrade. |
+| `notemap_ingest` | Chunk and ingest text content for semantic search. Splits text into boundary-aware chunks with embeddings. |
 
 ### Evidence Quality System
 
@@ -108,23 +167,33 @@ Rule: `unverified` can never pair with `strong`. If Claude's confidence comes fr
 
 Anti-pattern notes include `primitives_to_avoid` patterns (regex) and `preferred_alternatives`. The `notemap_lint` tool checks code against these patterns -- it's a data-driven linter that gets smarter with every correction, no code changes needed.
 
-### Adaptive Review
+### Adaptive Review (5-Tier Leitner System)
 
-Notes track `miss_count` (how often they led to wrong code) and `review_count` (how often they've been verified). Notes that keep causing errors get shorter review intervals and higher priority in the review queue. Notes that are consistently useful get longer intervals.
+Notes progress through 5 review tiers with increasing intervals:
+
+| Tier | Interval | How to reach |
+|------|----------|-------------|
+| 1 | 14 days | Demoted (2+ misses) |
+| 2 | 30 days | Default for new notes |
+| 3 | 60 days | 2+ clean reviews, 0 misses |
+| 4 | 120 days | Continued clean reviews |
+| 5 | 365 days | Consistently verified |
+
+Intervals are modified by confidence (strong 1.3x, weak 0.7x), note type (anti-patterns reviewed more often), and miss history (0.8^miss_count penalty). Notes with miss_ratio > 0.5 are flagged as leeches for rewrite or deletion. Confidence decays automatically without review (strong -> maybe -> weak).
+
+`notemap_check` on clean code implicitly reviews relevant notes, so actively-used notes maintain themselves.
 
 ## What It Creates
 
 ```
 ~/.claude/
-    notemap-mcp/              # Python MCP server (11 tools)
+    notemap-mcp/              # Python MCP server (17 files)
         server.py, notes.py, search.py, audit.py, lint.py,
-        preflight.py, check.py, index.py, models.py, utils.py,
-        requirements.txt
-    notemap/                  # Note storage (created on first use)
-        _index.json           # Search index (auto-rebuilt)
-        {library}/            # One subdirectory per library
-            {topic-slug}.md   # One note per topic (Cornell format)
-        _archive/             # Soft-deleted notes
+        preflight.py, check.py, index.py, db.py, graph.py,
+        events.py, models.py, utils.py, embed.py, chunk.py,
+        rag.py, requirements.txt
+    notemap/                  # Note storage
+        notemap.db            # SQLite database (single file, all notes + search index + events)
     commands/
         notemap.md            # /notemap slash command
     docs/
@@ -132,47 +201,26 @@ Notes track `miss_count` (how often they led to wrong code) and `review_count` (
     skills/
         notemap-review.md     # /notemap review skill
     scripts/notemap/          # Hook scripts (auto-run by Claude Code)
-        session-start.sh      # Preflight reminder at session start
-        pre-edit.sh           # Search reminder before edits
-        post-edit.sh          # Check reminder after edits
+        session-start.sh, post-edit.sh,
+        user-prompt.sh    # Automatically searches your notes on every prompt and injects relevant context
     CLAUDE.md                 # Notemap instructions (sentinel-injected)
-~/.claude.json                # MCP server registration (merged into existing config)
-~/.claude/settings.json       # Hook registration (merged into existing hooks)
+~/.claude.json                # MCP server registration
+~/.claude/settings.json       # Hook registration
 ```
 
-### Note File Format
+### Database Schema
 
-Each note is a markdown file with YAML frontmatter:
+Notes are stored in a SQLite database with FTS5 full-text search:
 
-```markdown
----
-id: "zendb-db-get-returns-empty-smartarrayhtml-on-no-match"
-library: "zendb"
-type: "knowledge"
-topic: "DB::get() returns empty SmartArrayHtml on no match"
-source_quality: "verified-from-source"
-confidence: "strong"
-lifecycle: "active"
-review_interval_days: 30
-miss_count: 0
-tags: ["query", "return-type", "gotcha"]
-related_functions: ["DB::get", "DB::select"]
----
-
-## Cues
-- What does DB::get() return when no record matches?
-- How do you check if DB::get() found a record?
-
-## Notes
-- Returns empty SmartArrayHtml, NOT SmartNull
-- Check with ->isEmpty(), never empty()
-- Auto-adds LIMIT 1
-[verified-from-source | strong]
-
-## Summary
-DB::get() always returns SmartArrayHtml. Empty on no match.
-Check ->isEmpty(), never empty().
-```
+- **`notes`** -- id, library, topic, type, summary, notes_body, cues, confidence, source_quality, lifecycle, review_tier, review_interval_days, miss_count, review_count, dates, sources (JSON), miss_log (JSON)
+- **`note_tags`** -- many-to-many tags per note
+- **`note_functions`** -- many-to-many function references per note
+- **`note_links`** -- typed relationships between notes (related, extends, depends_on, supersedes, contradicts)
+- **`note_topics`** -- additional library/topic memberships
+- **`note_anti_patterns`** -- regex patterns to avoid (powers notemap_lint)
+- **`note_alternatives`** -- preferred alternatives for anti-patterns
+- **`notes_fts`** -- FTS5 full-text search index with BM25 scoring
+- **`events`** -- usage tracking and gap detection log
 
 ## CLAUDE.md Integration
 
@@ -187,6 +235,22 @@ The installer adds one block to `~/.claude/CLAUDE.md`, delimited by sentinel com
 ```
 
 The sentinel tags allow the installer to update the block without affecting the rest of CLAUDE.md. The `@docs/notemap.md` reference loads the detailed trigger lists, workflow examples, and CRUD guidance.
+
+## Hooks
+
+The installer registers three hook scripts in `~/.claude/settings.json`. These run automatically during Claude Code sessions to keep notemap integrated into the coding workflow.
+
+| Hook | Event | What it does |
+|------|-------|-------------|
+| `session-start.sh` | `SessionStart` | Reminds Claude to run `notemap_preflight` so anti-patterns and gotchas are loaded before any coding begins |
+| `post-edit.sh` | `PostToolUse` (Edit tool) | Reminds Claude to run `notemap_check` after editing to verify no anti-patterns were introduced |
+| `user-prompt.sh` | `UserPromptSubmit` | Runs RAG retrieval against your notes and injects relevant context before Claude processes your message |
+
+The first two hooks output short reminder messages. The third (`user-prompt.sh`) runs the RAG pipeline silently, injecting matching notes as `additionalContext` so Claude sees them without you having to ask.
+
+### Disabling hooks
+
+To disable any hook, remove or comment out its entry in `~/.claude/settings.json` under the appropriate event key (`hooks.SessionStart`, `hooks.PostToolUse`, or `hooks.UserPromptSubmit`). Changes take effect on the next Claude Code session.
 
 ## Usage
 
@@ -210,10 +274,13 @@ Claude re-reads the source, creates notes for new findings, updates changed note
 
 ```
 notemap_stats()
-# Returns: zendb/3, smartarray/3, learning-principles/24 ...
+# -> zendb: 3, smartarray: 5, _cross-cutting: 48, learning-principles: 24 ...
 
-notemap_search(library="zendb")
-# Returns summaries of all zendb notes
+notemap_preflight(libraries=["zendb", "smartarray", "smartstring"])
+# -> watch_out: 3 anti-patterns (sorted by quality)
+# -> know_this: 8 knowledge notes
+# -> function_index: {DB::get: [2 notes], isEmpty: [1 note]}
+# -> library_summaries: {"zendb": "Key gotchas: DB::get returns empty SmartArrayHtml..."}
 ```
 
 ### During Coding
@@ -226,14 +293,24 @@ notemap_search(function_name="DB::get")
 notemap_create(
   library="mylib",
   topic="transform() silently drops null values",
+  type="anti-pattern",
   notes="transform() skips null entries without warning...",
   summary="transform() silently drops nulls. Filter first or use transformAll().",
+  cues=["What happens when transform() encounters null?",
+        "How to safely transform a list that may contain nulls?",
+        "Why did my data shrink after transform()?"],
+  sources=[{"type": "file", "path": "src/transforms.py", "lines": "42-58"}],
+  related_functions=["transform", "transformAll"],
+  tags=["null-handling", "silent-failure", "data-loss"],
+  primitives_to_avoid=["\\btransform\\([^)]*\\)"],
+  preferred_alternatives=["transformAll() or filter nulls first"],
   source_quality="runtime-tested",
   confidence="strong"
 )
 
 # After writing code:
-notemap_lint(code="result = raw_func(data)", library="mylib")
+notemap_check(file_path="src/myfile.py")
+# -> detected_libraries, lint_warnings, function_notes
 ```
 
 ### Periodic Review
@@ -279,7 +356,7 @@ This removes the MCP server, docs, skill, and CLAUDE.md blocks. Your notes in `~
 | Claude doesn't search notes | Check that CLAUDE.md has the `<!-- NOTEMAP:INSTRUCTIONS:BEGIN -->` sentinel block |
 | MCP server not connecting | Check `~/.claude.json` has a "notemap" entry inside `mcpServers` with the correct Python path |
 | Search returns nothing | Notes are created per-library; check `notemap_stats()` to see what libraries have notes |
-| Hooks not firing | Check `~/.claude/settings.json` for notemap entries under `hooks.SessionStart`, `hooks.PreToolUse`, `hooks.PostToolUse`. Settings are snapshotted at startup -- start a fresh session after install. |
+| Hooks not firing | Check `~/.claude/settings.json` for notemap entries under `hooks.SessionStart`, `hooks.PostToolUse`, `hooks.UserPromptSubmit`. Settings are snapshotted at startup -- start a fresh session after install. |
 
 ## Architecture
 
@@ -303,16 +380,22 @@ notemap/
 
     src/
         notemap-mcp/              # Python MCP server
-            server.py             # FastMCP entry point (11 tools)
-            notes.py              # CRUD operations
-            search.py             # Relevance-scored search
+            server.py             # FastMCP entry point (14 tools)
+            notes.py              # CRUD operations (auto-embeds on create/update)
+            search.py             # Hybrid BM25F + vector search with RRF
             audit.py              # Staleness checks + review queue
             lint.py               # Anti-pattern detection
-            preflight.py          # Library briefing (session start)
+            preflight.py          # Library briefing with context budgeting + topic focus
             check.py              # Code checker (post-coding safety net)
-            index.py              # JSON index management
+            index.py              # SQLite bridge (loads notes into in-memory dict format)
+            db.py                 # Database management (schema, migrations, connections)
+            embed.py              # Vector embeddings (model2vec, graceful degradation)
+            chunk.py              # Boundary-aware text chunking for knowledge ingestion
+            rag.py                # RAG retrieval for UserPromptSubmit hook
+            graph.py              # Knowledge graph algorithms (PageRank, communities, paths)
+            events.py             # Event logging (usage tracking, gap detection)
             models.py             # Enums and data classes
-            utils.py              # Slugify, dates, paths
+            utils.py              # Slugify, dates, paths, token estimation
             requirements.txt      # pip dependencies
 
         docs/
@@ -329,8 +412,8 @@ notemap/
 
         hooks/                        # Hook scripts (auto-run by Claude Code)
             session-start.sh          # SessionStart: preflight reminder
-            pre-edit.sh               # PreToolUse: search reminder before edits
             post-edit.sh              # PostToolUse: check reminder after edits
+            user-prompt.sh            # UserPromptSubmit: RAG retrieval
 
     tests/
         test_search.py            # Search scoring tests
@@ -344,6 +427,11 @@ notemap/
         test_notes_helpers.py     # Note section parsing tests
         test_preflight.py         # Preflight briefing tests
         test_check.py             # Code checker tests
+        test_embed.py             # Embedding module tests
+        test_chunk.py             # Text chunking tests
+        test_hybrid_search.py     # Hybrid BM25F + vector search tests
+        test_rag.py               # RAG retrieval tests
+        test_budgeting.py         # Context budgeting + token estimation tests
         test_install_uninstall.sh # End-to-end install/uninstall test (sandboxed)
         fixtures/
             sample-note.md

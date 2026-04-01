@@ -54,3 +54,24 @@ jobs:
 
       - name: Run check tests
         run: python -m unittest tests.test_check -v
+
+      - name: Run budgeting tests
+        run: python -m unittest tests.test_budgeting -v
+
+      - name: Run chunk tests
+        run: python -m unittest tests.test_chunk -v
+
+      - name: Run embed tests
+        run: python -m unittest tests.test_embed -v
+
+      - name: Run events tests
+        run: python -m unittest tests.test_events -v
+
+      - name: Run graph tests
+        run: python -m unittest tests.test_graph -v
+
+      - name: Run hybrid search tests
+        run: python -m unittest tests.test_hybrid_search -v
+
+      - name: Run RAG tests
+        run: python -m unittest tests.test_rag -v

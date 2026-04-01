@@ -1,12 +1,13 @@
-"""Tests for the notemap index rebuild logic.
+"""Tests for the notemap index module (SQLite-backed).
 
-Covers parse_note_file, rebuild_index, and save_index round-tripping.
+Covers parse_note_file (legacy), load_or_rebuild_index (SQLite bridge),
+and save_index (no-op in SQLite mode).
+
 Run with: python -m unittest tests.test_index
 """
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sys
 import tempfile
@@ -14,12 +15,13 @@ import unittest
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Make the index module importable
+# Make the modules importable
 # ---------------------------------------------------------------------------
 _SRC_DIR = Path(__file__).resolve().parent.parent / "src" / "notemap-mcp"
 sys.path.insert(0, str(_SRC_DIR))
 
 import index  # noqa: E402 -- path manipulation required before import
+from db import close_db, get_db  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +37,7 @@ class TestParseNoteFile(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="notemap_test_"))
         # Copy the fixture into the temp dir so relative-path logic works
+        import shutil
         shutil.copy2(_SAMPLE_NOTE, self.tmp_dir / "sample-note.md")
         self.note_path = self.tmp_dir / "sample-note.md"
 
@@ -105,37 +108,36 @@ class TestParseNoteFile(unittest.TestCase):
 
 
 class TestRebuildIndex(unittest.TestCase):
-    """Tests for index.rebuild_index scanning a temp directory."""
+    """Tests for index.rebuild_index loading from SQLite."""
 
     def setUp(self) -> None:
+        close_db()
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="notemap_test_"))
 
     def tearDown(self) -> None:
+        close_db()
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
-    def _write_note(self, subpath: str, note_id: str) -> Path:
-        """Write a minimal valid note file at the given subpath."""
-        dest = self.tmp_dir / subpath
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        content = (
-            "---\n"
-            f'id: "{note_id}"\n'
-            f'library: "test-lib"\n'
-            f'topic: "Note {note_id}"\n'
-            "---\n"
-            "\n"
-            "## Notes\n"
-            "Some content.\n"
-        )
-        dest.write_text(content, encoding="utf-8")
-        return dest
+    def _insert_note(self, note_id: str, library: str = "test-lib") -> None:
+        """Insert a stub note directly into the SQLite DB."""
+        conn = get_db(self.tmp_dir)
+        conn.execute("""
+            INSERT INTO notes (id, library, topic, type, summary, notes_body, cues_raw,
+                             source_quality, confidence, lifecycle,
+                             created, last_modified, last_reviewed)
+            VALUES (?, ?, ?, 'knowledge', 'Summary', 'Notes content', '',
+                    'unverified', 'maybe', 'active',
+                    '2026-01-01', '2026-01-01', '2026-01-01')
+        """, (note_id, library, f"Note {note_id}"))
+        conn.commit()
 
-    # 8. Finds all .md files in the temp directory
-    def test_finds_all_md_files(self) -> None:
-        self._write_note("alpha.md", "alpha")
-        self._write_note("beta.md", "beta")
-        self._write_note("subdir/gamma.md", "gamma")
+    # 8. Loads all notes from the database
+    def test_finds_all_notes(self) -> None:
+        self._insert_note("alpha")
+        self._insert_note("beta")
+        self._insert_note("gamma")
 
+        close_db()
         result = index.rebuild_index(self.tmp_dir)
 
         self.assertIn("alpha", result)
@@ -143,73 +145,75 @@ class TestRebuildIndex(unittest.TestCase):
         self.assertIn("gamma", result)
         self.assertEqual(len(result), 3)
 
-    # 9. Skips files in _archive/ subdirectory
-    def test_skips_archive_directory(self) -> None:
-        self._write_note("active.md", "active")
-        self._write_note("_archive/old.md", "archived")
+    # 9. Archived notes are loaded but have lifecycle='archived'
+    def test_loads_archived_notes(self) -> None:
+        self._insert_note("active-note")
+        conn = get_db(self.tmp_dir)
+        conn.execute("""
+            INSERT INTO notes (id, library, topic, type, summary, notes_body, cues_raw,
+                             source_quality, confidence, lifecycle,
+                             created, last_modified, last_reviewed)
+            VALUES ('archived-note', 'test-lib', 'Archived Note', 'knowledge', 'S', 'N', '',
+                    'unverified', 'maybe', 'archived',
+                    '2026-01-01', '2026-01-01', '2026-01-01')
+        """)
+        conn.commit()
 
+        close_db()
         result = index.rebuild_index(self.tmp_dir)
 
-        self.assertIn("active", result)
-        self.assertNotIn("archived", result)
-        self.assertEqual(len(result), 1)
+        self.assertIn("active-note", result)
+        self.assertIn("archived-note", result)
+        self.assertEqual(result["archived-note"]["lifecycle"], "archived")
 
 
-class TestSaveAndReloadIndex(unittest.TestCase):
-    """Tests for round-tripping through save_index + JSON reload."""
+class TestSaveIndex(unittest.TestCase):
+    """Tests for save_index (no-op in SQLite mode)."""
 
     def setUp(self) -> None:
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="notemap_test_"))
 
     def tearDown(self) -> None:
+        close_db()
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
-    # 10. save_index + reload produces same entries
-    def test_save_and_reload_round_trip(self) -> None:
-        original_index = {
+    # 10. save_index is a no-op and does not create _index.json
+    def test_save_index_is_noop(self) -> None:
+        test_index = {
             "note-one": {
                 "id": "note-one",
                 "library": "test-lib",
                 "topic": "First Note",
-                "type": "knowledge",
-                "tags": ["alpha"],
-                "cues": ["What is note one?"],
-                "summary": "Note one summary.",
-                "related_functions": ["func_a"],
-                "related_notes": [],
-                "path": "note-one.md",
-            },
-            "note-two": {
-                "id": "note-two",
-                "library": "test-lib",
-                "topic": "Second Note",
-                "type": "anti-pattern",
-                "tags": ["beta", "gamma"],
-                "cues": [],
-                "summary": "Note two summary.",
-                "related_functions": [],
-                "related_notes": ["note-one"],
-                "path": "note-two.md",
             },
         }
 
-        index.save_index(self.tmp_dir, original_index)
+        index.save_index(self.tmp_dir, test_index)
 
-        # Reload from the written file
+        # No _index.json should be created (SQLite handles persistence)
         index_path = self.tmp_dir / "_index.json"
-        self.assertTrue(index_path.exists(), "_index.json must exist after save")
+        self.assertFalse(index_path.exists(), "save_index should be a no-op in SQLite mode")
 
-        raw = json.loads(index_path.read_text(encoding="utf-8"))
-        reloaded = raw["notes"]
+    # 11. Data persists through SQLite, not JSON
+    def test_data_round_trips_via_sqlite(self) -> None:
+        conn = get_db(self.tmp_dir)
+        conn.execute("""
+            INSERT INTO notes (id, library, topic, type, summary, notes_body, cues_raw,
+                             source_quality, confidence, lifecycle,
+                             created, last_modified, last_reviewed)
+            VALUES ('rt-note', 'test-lib', 'Round Trip', 'knowledge', 'Summary text', 'Notes text', 'cue1',
+                    'verified-from-source', 'strong', 'active',
+                    '2026-01-01', '2026-01-01', '2026-01-01')
+        """)
+        conn.execute("INSERT INTO note_tags VALUES ('rt-note', 'alpha')")
+        conn.commit()
+        close_db()
 
-        self.assertEqual(set(reloaded.keys()), set(original_index.keys()))
-        for note_id, original_entry in original_index.items():
-            for field, value in original_entry.items():
-                self.assertEqual(
-                    reloaded[note_id][field],
-                    value,
-                    f"Mismatch on {note_id}.{field}",
-                )
+        # Reload from SQLite
+        result = index.rebuild_index(self.tmp_dir)
+        self.assertIn("rt-note", result)
+        self.assertEqual(result["rt-note"]["topic"], "Round Trip")
+        self.assertEqual(result["rt-note"]["summary"], "Summary text")
+        self.assertIn("alpha", result["rt-note"]["tags"])
 
 
 if __name__ == "__main__":
