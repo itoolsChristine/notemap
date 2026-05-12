@@ -345,8 +345,8 @@ class TestPreflightBasic(unittest.TestCase):
         s = result["summary"]
         tier_total = sum(len(t) for t in result["tiers"].values())
         self.assertEqual(s["total_notes"], tier_total)
-        # by_type should have all 8 recognized types
-        self.assertEqual(len(s["by_type"]), 8)
+        # by_type should have all 11 recognized note types (see models.NoteType)
+        self.assertEqual(len(s["by_type"]), 11)
         # Spot-check counts against tier contents
         ap_count = sum(1 for n in result["tiers"]["watch_out"] if n["type"] == "anti-pattern")
         self.assertEqual(s["by_type"]["anti-pattern"], ap_count)

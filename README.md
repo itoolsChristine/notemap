@@ -2,7 +2,7 @@
 
 **Give Claude a persistent knowledge base so it remembers gotchas, patterns, and corrections across sessions.**
 
-![Version](https://img.shields.io/badge/version-1.0.10-blue)
+![Version](https://img.shields.io/badge/version-1.2.0-blue)
 [![CI](https://github.com/itoolsChristine/notemap/actions/workflows/ci.yml/badge.svg)](https://github.com/itoolsChristine/notemap/actions/workflows/ci.yml)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -110,7 +110,7 @@ Use the `/notemap` command to scan a PDF or project:
 /notemap scan pdf
 ```
 
-Claude reads 20 pages at a time, ingests the raw text, and creates distilled notes for anything noteworthy. Notes persist across sessions and surface automatically via RAG whenever they're relevant to your prompt.
+Claude reads 20 pages at a time, ingests the raw text, and creates distilled notes for anything noteworthy. Both surface automatically: the RAG hook injects matching notes and (above a similarity floor) the most relevant ingested chunks, so a scanned document shows up in context even before it's been distilled into notes.
 
 ## How It Works
 
@@ -139,20 +139,22 @@ Claude follows a preflight-then-check workflow (injected into CLAUDE.md):
 
 | Tool | Purpose |
 |------|---------|
-| `notemap_preflight` | Load all notes for specified libraries at session start (anti-patterns first). Supports `context_budget` for token-aware loading and `topic_focus` for semantic prioritization. |
+| `notemap_preflight` | Load all notes for specified libraries at session start (anti-patterns first). `context_budget` (default 12000 tokens) keeps the response token-aware; `topic_focus` adds semantic prioritization. Pass `context_budget=0` for no limit. |
 | `notemap_check` | Auto-detect libraries from code and check for anti-patterns + function gotchas |
-| `notemap_create` | Create a new note (knowledge, anti-pattern, correction, or convention). Auto-generates embedding for semantic search. |
+| `notemap_create` | Create a new note (any note type -- knowledge, anti-pattern, correction, convention, technique, reference, decision, finding, requirement, communication, commitment). Auto-generates embedding for semantic search. |
 | `notemap_read` | Read a specific note by ID |
-| `notemap_search` | Hybrid search: BM25F keyword matching + vector embedding similarity, merged via reciprocal rank fusion |
-| `notemap_update` | Update a note (fix content, upgrade confidence, record misses). Re-embeds on content change. |
+| `notemap_search` | Hybrid search: BM25F keyword matching + vector embedding similarity, merged via reciprocal rank fusion. `max_results` defaults to 25; pass 0 for every match (large with a vague query). Needs at least one of query/library/function_name/tag/type. |
+| `notemap_update` | Update a note (fix content, upgrade confidence, record misses, change lifecycle). Re-embeds on content change. Warns on dangling `related_notes` targets. |
 | `notemap_delete` | Soft-delete (archive) or hard-delete a note |
-| `notemap_audit` | Find stale, low-confidence, or problematic notes |
-| `notemap_review` | Get a prioritized review queue |
+| `notemap_audit` | Find stale, low-confidence, or problematic notes (per-check lists are capped) |
+| `notemap_review` | Get a prioritized review queue (`limit` defaults to 25; pass 0 for the whole queue) |
 | `notemap_lint` | Check code against anti-pattern notes (regex-based) |
-| `notemap_stats` | Overview of libraries, note counts, health, and embedding status |
+| `notemap_stats` | Overview of libraries, note counts, health, and embedding status. `verbose=False` (default) omits the per-library coverage matrix and caps the libraries list to the 30 largest. |
 | `notemap_connections` | Query the knowledge graph for connections, paths, and suggestions |
 | `notemap_embed` | Generate embeddings for all notes (batch). Use after bulk import or model upgrade. |
-| `notemap_ingest` | Chunk and ingest text content for semantic search. Splits text into boundary-aware chunks with embeddings. |
+| `notemap_ingest` | Chunk and ingest text content for semantic search. Splits text into boundary-aware chunks with embeddings. The RAG hook surfaces matching chunks alongside notes. |
+
+> Every tool's response is size-capped (~80 KB of JSON). Above that, the largest lists are trimmed to a few leading entries plus a `_truncated` marker rather than returned raw -- a multi-MB blob over stdio can disconnect the MCP server. Pass `max_results` / `context_budget` / `verbose=False` to control the size deliberately.
 
 ### Evidence Quality System
 

@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-05-11
+
+Hardening release. Bounds every tool response so a single oversized result can't disconnect the MCP transport, trims per-create noise, fixes a latent search bug, and lets the RAG hook surface ingested document chunks. Adds three note types.
+
+### Added
+- **Response size guard:** `utils.safe_json_dumps()` caps every tool's serialized JSON (default ~80 KB), trimming the largest lists then long strings rather than returning a multi-MB blob that chokes stdio. Every tool return (including error responses) routes through it. New `notemap_audit` per-check list cap via `utils.cap_result_lists()`.
+- **Note types:** `requirement` (a spec/constraint the work must satisfy), `communication` (a message/conversation worth remembering), `commitment` (a promise or deadline -- short review interval).
+- **RAG hook surfaces ingested chunks:** `rag.py` now searches with `include_chunks=True` and appends the top few chunk hits (above a cosine floor) under an `## ingested sources` heading, counted against the same token budget. Previously a `notemap_ingest`'d document never appeared in the automatic context.
+- **`notemap_stats(verbose=False)`:** default response omits the per-library coverage matrix and caps the libraries list to the 30 largest; `verbose=True` returns the full picture.
+- **`notemap_search`** now reports an error when called with no query and no filters instead of silently returning the whole index.
+- **`notemap_update`** validates `related_notes` link targets and warns (does not block) on unknown note types; surfaces a `warnings` key.
+- **35 new unit tests** (`test_response_limits.py`) plus additions to `test_rag.py` and `test_sync.py`.
+
+### Changed
+- **Default `notemap_search` `max_results` is 25** (was 0 = unbounded); pass 0 for all matches.
+- **Default `notemap_preflight` `context_budget` is 12000 tokens** (was 0 = unbounded); pass 0 for no limit.
+- **Default `notemap_review` `limit` is 25** (was 0); pass 0 for the whole queue.
+- **`notemap_search` with `lifecycle="active"` now also surfaces `evergreen` notes** (matching preflight) -- they were silently dropped from search and from RAG injection.
+- **`notemap_create` warnings:** removed the per-create "library has N notes" nag (the `notemap_audit(check="density")` outlier check is the real signal); the "no sources" warning no longer fires when `source_quality` already asserts verification (`runtime-tested`/`verified-from-source`/`user-correction`); new warnings for unknown note types and dangling `related_notes` targets; the `{type:'user', context:...}` source form is documented in the docstring.
+
+### Fixed
+- **`server.py.__version__` was stale** (`1.0.10` while `VERSION` was `1.1.0`), so `notemap_stats` reported the wrong version. `sync.py` already propagates `VERSION` into the `__version__` literal; `tests/test_sync.py` now asserts they match in CI.
+- Removed two stray junk files (mangled-path artifacts) from the repo root.
+
 ## [1.1.0] - 2026-04-01
 
 First feature release. Adds hybrid search, knowledge graph, context budgeting, RAG pipeline, chunk storage, and embeddings on top of the v1.0.0 foundation.

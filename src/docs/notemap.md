@@ -8,20 +8,22 @@ Supplements the notemap section in CLAUDE.md. The CLAUDE.md block has the behavi
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
-| `notemap_stats` | Overview: note counts, libraries, health metrics | (none) |
-| `notemap_preflight` | Load all notes for libraries, organized by priority | `libraries`, `versions`, `include_cross_cutting` |
+| `notemap_stats` | Overview: note counts, libraries, health metrics | `verbose` (default False -- omits the per-library coverage matrix and caps the libraries list to the 30 largest) |
+| `notemap_preflight` | Load all notes for libraries, organized by priority | `libraries`, `versions`, `include_cross_cutting`, `context_budget` (default 12000 tokens; 0 = no limit), `topic_focus` |
 | `notemap_check` | Auto-detect libraries from code, lint, surface gotchas | `code` or `file_path`, `versions` |
-| `notemap_search` | Find notes by keyword, function, tag, type, library | `query`, `function_name`, `library`, `tag`, `type`, `max_results` |
+| `notemap_search` | Find notes by keyword, function, tag, type, library | `query`, `function_name`, `library`, `tag`, `type`, `max_results` (default 25; 0 = every match). `lifecycle="active"` also surfaces `evergreen` notes. Needs at least one of query/library/function_name/tag/type. |
 | `notemap_create` | Create a new note with full metadata | `library`, `topic`, `notes`, `summary`, `type`, `sources`, `cues`, `tags`, `related_functions`, `related_notes` |
 | `notemap_read` | Read a note's full content and linked note summaries | `id`, `section` |
-| `notemap_update` | Modify any field, mark reviewed, record misses | `id`, plus any field to change. Incremental: `cues={"add":[...]}`, `related_notes={"add":[...]}` |
+| `notemap_update` | Modify any field, mark reviewed, record misses, change lifecycle | `id`, plus any field to change. Incremental: `cues={"add":[...]}`, `related_notes={"add":[...]}`. Warns on dangling `related_notes` targets. |
 | `notemap_delete` | Soft-delete (archive) or hard-delete a note | `id`, `reason` |
 | `notemap_lint` | Check code against anti-pattern regex rules | `code`, `library` |
-| `notemap_audit` | Find stale, orphaned, leech, density, consolidation issues | `check` ("all", "stale", "orphan", "leech", "density", "consolidation", "source_changed", "confidence_decay") |
-| `notemap_review` | Prioritized review queue sorted by urgency | `library`, `limit` |
+| `notemap_audit` | Find stale, orphaned, leech, density, consolidation issues | `check` ("all", "stale", "orphan", "leech", "density", "consolidation", "source_changed", "confidence_decay"). Per-check result lists are capped. |
+| `notemap_review` | Prioritized review queue sorted by urgency | `library`, `limit` (default 25; 0 = whole queue) |
 | `notemap_connections` | Query the knowledge graph | `note_id`, `operation` ("neighborhood", "path", "suggest_links", "suggest_hubs", "pagerank", "communities"), `target_id`, `max_hops` |
 | `notemap_embed` | Generate/refresh embeddings for all notes | (none required) |
-| `notemap_ingest` | Chunk and ingest text content for semantic search | `code` or `file_path`, `library`, `chunk_size` |
+| `notemap_ingest` | Chunk and ingest text content for semantic search | `code` or `file_path`, `library`, `chunk_size`. Ingested chunks are surfaced by the RAG hook alongside notes. |
+
+> **Every tool's response is size-capped** (~80 KB of JSON, `utils.RESPONSE_CHAR_LIMIT`). Above that the largest lists are trimmed to a few leading entries plus a `_truncated` marker rather than returned raw -- a multi-MB result over stdio can disconnect the MCP server. Control the size deliberately with `max_results` / `context_budget` / `verbose=False` rather than relying on the cap.
 
 ---
 
@@ -142,9 +144,12 @@ notemap_connections(operation="communities")
 | `knowledge` | How something works, return types, behavior | | know_this |
 | `technique` | How to do something well | | know_this |
 | `convention` | Codebase rules and standards | `applies_to` | know_this |
+| `requirement` | A spec or constraint the work must satisfy | | know_this |
 | `reference` | A fact to look up later | | reference |
 | `decision` | Why a choice was made | | reference |
 | `finding` | What was observed/discovered | | reference |
+| `communication` | A message/email/conversation worth remembering (what was said, by whom) | | reference |
+| `commitment` | A promise or deadline you've made and need to honor (short review interval) | | reference |
 
 ---
 
@@ -222,9 +227,11 @@ notemap_update(id="zendb-db-get-returns-empty", additional_topics={"add": ["smar
 ### RAG Pipeline
 
 The `UserPromptSubmit` hook runs `rag.py` on every user message:
-1. Searches notemap with hybrid BM25 + vector search
-2. Injects relevant notes as `additionalContext` before Claude processes the message
-3. Token-budgeted (default 4000 tokens) to avoid context bloat
+1. Searches notemap with hybrid BM25 + vector search (`include_chunks=True`)
+2. Injects relevant notes as `additionalContext` before Claude processes the message, then -- below the notes -- the top few ingested chunks above a cosine floor under an `## ingested sources` heading (so a `notemap_ingest`'d PDF surfaces even before it's distilled into notes)
+3. Token-budgeted (default 6000 tokens) to avoid context bloat; notes and chunks share the budget, notes first
+
+An explicit `notemap_search(include_chunks=True)` still gives you the full chunk search separate from the hook.
 
 ---
 

@@ -5,9 +5,10 @@ Uses stdio transport for communication with Claude Code.
 """
 from __future__ import annotations
 
-__version__ = "1.0.10"
+# Single source of truth is the repo-root VERSION file; sync.py keeps this line
+# in step with it (and tests/test_sync.py asserts they match in CI).
+__version__ = "1.2.0"
 
-import json
 import traceback
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from lint import lint_code
 from preflight import preflight_notes
 from check import check_code
 from events import init_events, log_co_retrieval, log_event, log_search_miss
+from utils import cap_result_lists, safe_json_dumps
 
 try:
     from embed import EMBEDDINGS_AVAILABLE, encode_text, MODEL_NAME, DIMENSIONS, invalidate_cache
@@ -72,21 +74,35 @@ def _error_response(message: str, detail: str = "") -> str:
     payload: dict[str, str] = {"error": message}
     if detail:
         payload["detail"] = detail
-    return json.dumps(payload, indent=2)
+    return safe_json_dumps(payload, indent=2)
 
 
 # ---------------------------------------------------------------------------
 # FastMCP instance
 # ---------------------------------------------------------------------------
 
-mcp_server = FastMCP("notemap")
+mcp_server = FastMCP(
+    "notemap",
+    instructions=(
+        "Persistent knowledge base for gotchas, anti-patterns, and learned insights. "
+        "Run notemap_preflight at session start to load anti-patterns. "
+        "Run notemap_check after writing or editing code to catch issues. "
+        "Use notemap_search before relying on training data alone. "
+        "Create notes with notemap_create when you learn something surprising."
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
 # Tool: notemap_create
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={
+        "anthropic/alwaysLoad": True,
+        "anthropic/searchHint": "save learning gotcha note knowledge anti-pattern correction",
+    },
+)
 def notemap_create(
     library: str,
     topic: str,
@@ -147,7 +163,7 @@ def notemap_create(
             "applies_to":             applies_to,
         }
         result = create_note(index, NOTEMAP_DIR, params)
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -156,7 +172,9 @@ def notemap_create(
 # Tool: notemap_read
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={"anthropic/searchHint": "read note full detail body metadata cues"},
+)
 def notemap_read(
     id: str,
     section: str = "all",
@@ -202,7 +220,7 @@ def notemap_read(
             if linked_summaries:
                 result["linked_notes"] = linked_summaries
 
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -211,7 +229,12 @@ def notemap_read(
 # Tool: notemap_search
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={
+        "anthropic/alwaysLoad": True,
+        "anthropic/searchHint": "search lookup gotcha function note knowledge anti-pattern",
+    },
+)
 def notemap_search(
     query: str | None = None,
     library: str | None = None,
@@ -221,7 +244,7 @@ def notemap_search(
     source_quality: str | None = None,
     confidence: str | None = None,
     lifecycle: str = "active",
-    max_results: int = 0,
+    max_results: int = 25,
     include_chunks: bool = False,
 ) -> str:
     """Search notes by keyword, library/topic, function, tag, or type.
@@ -229,11 +252,14 @@ def notemap_search(
     library filters by topic/domain. Supports hierarchical matching:
     library='javascript' matches both 'javascript' and 'javascript/json'.
     Also matches notes that list the library in their additional_topics.
+    lifecycle='active' (the default) also surfaces evergreen notes.
 
     include_chunks=True also searches ingested document chunks by embedding
     similarity and returns them in a separate 'chunks' key.
 
-    Returns matching notes ranked by relevance score. max_results=0 means all.
+    Returns matching notes ranked by relevance score. max_results defaults to 25;
+    pass 0 to return every match -- a vague query can then produce a very large
+    response, so only do that with a narrow query or strict filters.
     """
     try:
         index = get_index()
@@ -257,7 +283,7 @@ def notemap_search(
             log_co_retrieval(result_ids, "notemap_search")
         if result.get("count", 0) == 0 and (query or function_name):
             log_search_miss(query or function_name)
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -266,7 +292,9 @@ def notemap_search(
 # Tool: notemap_update
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={"anthropic/searchHint": "update fix note mark reviewed record miss"},
+)
 def notemap_update(
     id: str,
     cues: dict | None = None,
@@ -276,6 +304,7 @@ def notemap_update(
     tags: dict | None = None,
     source_quality: str | None = None,
     confidence: str | None = None,
+    lifecycle: str | None = None,
     related_functions: dict | None = None,
     related_notes: dict | None = None,
     library_version: str | None = None,
@@ -299,6 +328,12 @@ def notemap_update(
 
     new_library moves the note to a different library.
 
+    lifecycle accepts: active / stale / evergreen / dormant / archived
+    (see models.Lifecycle). Use 'archived' to retire a note that
+    documented a now-resolved issue, keeping its history searchable
+    via include_archived filters but excluding it from default
+    preflight / search results.
+
     Sources is a list of dicts (full replacement, not incremental):
       - {type: "file", path: "src/DB.php", lines: "304-335"}
       - {type: "url", url: "https://...", section: "Rate limits"}
@@ -315,6 +350,7 @@ def notemap_update(
             "tags":                   tags,
             "source_quality":         source_quality,
             "confidence":             confidence,
+            "lifecycle":              lifecycle,
             "related_functions":      related_functions,
             "related_notes":          related_notes,
             "library_version":        library_version,
@@ -336,7 +372,7 @@ def notemap_update(
             log_event(id, "reviewed", "notemap_update")
         if increment_miss:
             log_event(id, "missed", "notemap_update")
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -345,7 +381,9 @@ def notemap_update(
 # Tool: notemap_delete
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={"anthropic/searchHint": "delete remove archive obsolete note"},
+)
 def notemap_delete(
     id: str,
     reason: str | None = None,
@@ -364,7 +402,7 @@ def notemap_delete(
             "hard_delete": hard_delete,
         }
         result = delete_note(index, NOTEMAP_DIR, params)
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -373,7 +411,9 @@ def notemap_delete(
 # Tool: notemap_audit
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={"anthropic/searchHint": "audit stale orphan leech density health check"},
+)
 def notemap_audit(
     check: str = "all",
     stale_days: int | None = None,
@@ -400,7 +440,7 @@ def notemap_audit(
             "apply_decay": apply_decay,
         }
         result = audit_notes(index, NOTEMAP_DIR, params)
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(cap_result_lists(result), indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -409,17 +449,19 @@ def notemap_audit(
 # Tool: notemap_review
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={"anthropic/searchHint": "review queue prioritized stale notes due"},
+)
 def notemap_review(
     library: str | None = None,
-    limit: int = 0,
+    limit: int = 25,
 ) -> str:
     """Get a prioritized review queue.
 
     library filters by topic/domain. Supports hierarchical matching.
 
     Returns notes most in need of review, ranked by staleness, miss count,
-    and confidence level. Limit=0 means return all.
+    and confidence level. limit defaults to 25; pass 0 to return the whole queue.
     """
     try:
         index = get_index()
@@ -428,7 +470,7 @@ def notemap_review(
             "limit":   limit,
         }
         result = review_queue(index, params)
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -437,7 +479,9 @@ def notemap_review(
 # Tool: notemap_lint
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={"anthropic/searchHint": "lint code anti-pattern scan check quick"},
+)
 def notemap_lint(
     code: str,
     library: str | None = None,
@@ -456,7 +500,7 @@ def notemap_lint(
             "library": library,
         }
         result = lint_code(index, params)
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -465,13 +509,22 @@ def notemap_lint(
 # Tool: notemap_stats
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
-def notemap_stats() -> str:
+@mcp_server.tool(
+    meta={
+        "anthropic/alwaysLoad": True,
+        "anthropic/searchHint": "stats overview knowledge base note count libraries health",
+    },
+)
+def notemap_stats(verbose: bool = False) -> str:
     """Get an overview of the notemap knowledge base.
 
     Returns: total note count, libraries/topics with note counts,
     note type breakdown, and overall health indicators.
     Use this at session start to discover what topics have notes.
+
+    verbose=False (default) keeps the response small: the per-library x per-type
+    coverage matrix is omitted and the libraries list is capped to the 30
+    largest. Pass verbose=True for the full matrix and every library.
     """
     try:
         index = get_index()
@@ -524,13 +577,15 @@ def notemap_stats() -> str:
 
         utilization_rate = len(retrieved_note_ids) / total_notes if total_notes > 0 else 0.0
 
+        # Per-library x per-type coverage matrix -- only built when requested;
+        # for ~140 libraries it's the bulk of the response.
         coverage: dict[str, dict[str, int]] = {}
-        for nid, entry in index.items():
-            lib = entry.get("library", "unknown")
-            ntype = entry.get("type", "knowledge")
-            if lib not in coverage:
-                coverage[lib] = {}
-            coverage[lib][ntype] = coverage[lib].get(ntype, 0) + 1
+        if verbose:
+            for nid, entry in index.items():
+                lib = entry.get("library", "unknown")
+                ntype = entry.get("type", "knowledge")
+                coverage.setdefault(lib, {})
+                coverage[lib][ntype] = coverage[lib].get(ntype, 0) + 1
 
         from datetime import date as _date_type
         review_backlog = 0
@@ -567,10 +622,28 @@ def notemap_stats() -> str:
         except Exception:
             pass
 
+        libs_sorted = sorted(libs.items(), key=lambda x: -x[1])
+        if verbose or len(libs_sorted) <= 30:
+            libraries_out: dict[str, Any] = dict(libs_sorted)
+        else:
+            libraries_out = dict(libs_sorted[:30])
+            libraries_out["_truncated"] = True
+            libraries_out["_total_libraries"] = len(libs_sorted)
+            libraries_out["_note"] = "showing the 30 largest libraries -- pass verbose=True for all"
+
+        health: dict[str, Any] = {
+            "utilization_rate_90d": round(utilization_rate, 3),
+            "notes_retrieved_90d":  len(retrieved_note_ids),
+            "review_backlog":       review_backlog,
+            "avg_review_tier":      round(tier_sum / tier_count, 2) if tier_count > 0 else 0,
+        }
+        if verbose:
+            health["coverage_matrix"] = coverage
+
         result = {
             "version": __version__,
             "total_notes": total_notes,
-            "libraries": dict(sorted(libs.items(), key=lambda x: -x[1])),
+            "libraries": libraries_out,
             "note_types": types,
             "stale_notes": stale_count,
             "low_confidence_notes": low_conf_count,
@@ -580,13 +653,7 @@ def notemap_stats() -> str:
                 "avg_links_per_note": round(total_links / max(total_notes, 1), 2),
                 "orphan_count": total_notes - notes_with_links,
             },
-            "health": {
-                "utilization_rate_90d": round(utilization_rate, 3),
-                "notes_retrieved_90d":  len(retrieved_note_ids),
-                "coverage_matrix":      coverage,
-                "review_backlog":       review_backlog,
-                "avg_review_tier":      round(tier_sum / tier_count, 2) if tier_count > 0 else 0,
-            },
+            "health": health,
             "embeddings": {
                 "available": EMBEDDINGS_AVAILABLE,
                 "model": MODEL_NAME if EMBEDDINGS_AVAILABLE else None,
@@ -596,7 +663,7 @@ def notemap_stats() -> str:
                 "total_chunks": total_chunks,
             },
         }
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -605,12 +672,17 @@ def notemap_stats() -> str:
 # Tool: notemap_preflight
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={
+        "anthropic/alwaysLoad": True,
+        "anthropic/searchHint": "session start load gotchas anti-patterns preflight libraries",
+    },
+)
 def notemap_preflight(
     libraries: list[str],
     versions: dict | None = None,
     include_cross_cutting: bool = True,
-    context_budget: int = 0,
+    context_budget: int = 12000,
     topic_focus: str = "",
 ) -> str:
     """Load all notes for the specified libraries/topics in a compact briefing format.
@@ -629,9 +701,10 @@ def notemap_preflight(
     (e.g., {"zendb": "3.0", "smartstring": "2.8"}). When provided, notes
     with incompatible library_version fields are excluded.
 
-    context_budget is the maximum token budget for the response (0 = unlimited).
-    When set, notes are assigned detail levels (0-3) to fit within the budget.
-    Anti-patterns always get full detail. Other notes are ranked by relevance.
+    context_budget is the max token budget for the response, default 12000.
+    Notes are assigned detail levels (0-3) to fit within it; anti-patterns
+    always get full detail, others are ranked by relevance. Pass 0 for no limit
+    -- with many in-scope notes that can produce a very large response.
 
     topic_focus is an optional string describing the current task focus.
     When set and embeddings are available, uses semantic similarity to
@@ -650,7 +723,7 @@ def notemap_preflight(
         for tier_name in ("watch_out", "know_this", "reference"):
             for note in result.get("tiers", {}).get(tier_name, []):
                 log_event(note.get("id", ""), "preflight_loaded", "notemap_preflight")
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -659,7 +732,12 @@ def notemap_preflight(
 # Tool: notemap_check
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={
+        "anthropic/alwaysLoad": True,
+        "anthropic/searchHint": "check code after edit lint anti-pattern function gotcha",
+    },
+)
 def notemap_check(
     code: str = "",
     file_path: str | None = None,
@@ -699,7 +777,7 @@ def notemap_check(
                     check_note_ids.append(nid)
         if len(check_note_ids) >= 2:
             log_co_retrieval(check_note_ids, "notemap_check")
-        return json.dumps(result, indent=2)
+        return safe_json_dumps(result, indent=2)
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
 
@@ -708,7 +786,9 @@ def notemap_check(
 # Tool: notemap_connections
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={"anthropic/searchHint": "knowledge graph connections neighbors path communities pagerank"},
+)
 def notemap_connections(
     note_id: str | None = None,
     operation: str = "neighborhood",
@@ -741,26 +821,26 @@ def notemap_connections(
 
         if operation == "neighborhood":
             if not note_id:
-                return json.dumps({"error": "note_id required for neighborhood"})
+                return safe_json_dumps({"error": "note_id required for neighborhood"})
             result = get_neighborhood(index, backlinks, note_id, max_hops)
-            return json.dumps({"note_id": note_id, "neighborhood": result, "count": len(result)}, indent=2)
+            return safe_json_dumps({"note_id": note_id, "neighborhood": result, "count": len(result)}, indent=2)
 
         elif operation == "path":
             if not note_id or not target_id:
-                return json.dumps({"error": "note_id and target_id required for path"})
+                return safe_json_dumps({"error": "note_id and target_id required for path"})
             path = shortest_path(index, backlinks, note_id, target_id)
             if path:
-                return json.dumps({"from": note_id, "to": target_id, "path": path, "hops": len(path) - 1}, indent=2)
-            return json.dumps({"from": note_id, "to": target_id, "path": None, "message": "No path found"}, indent=2)
+                return safe_json_dumps({"from": note_id, "to": target_id, "path": path, "hops": len(path) - 1}, indent=2)
+            return safe_json_dumps({"from": note_id, "to": target_id, "path": None, "message": "No path found"}, indent=2)
 
         elif operation == "suggest_hubs":
             suggestions = suggest_hub_notes(index, backlinks)
-            return json.dumps({"suggestions": suggestions, "count": len(suggestions)}, indent=2)
+            return safe_json_dumps({"suggestions": suggestions, "count": len(suggestions)}, indent=2)
 
         elif operation == "pagerank":
             scores = pagerank(index, backlinks)
             top = sorted(scores.items(), key=lambda x: -x[1])[:20]
-            return json.dumps({
+            return safe_json_dumps({
                 "top_notes": [
                     {"id": nid, "score": round(s, 6), "topic": index.get(nid, {}).get("topic", "")}
                     for nid, s in top
@@ -781,12 +861,12 @@ def notemap_connections(
                     "members": members[:10],
                     "sample_topics": [index.get(m, {}).get("topic", "")[:60] for m in members[:5]],
                 })
-            return json.dumps({"communities": result_groups, "total_communities": len(groups)}, indent=2)
+            return safe_json_dumps({"communities": result_groups, "total_communities": len(groups)}, indent=2)
 
         elif operation == "bridges":
             scores = betweenness_centrality(index, backlinks)
             top = sorted(scores.items(), key=lambda x: -x[1])[:20]
-            return json.dumps({
+            return safe_json_dumps({
                 "top_bridges": [
                     {"id": nid, "centrality": round(s, 6), "topic": index.get(nid, {}).get("topic", "")}
                     for nid, s in top
@@ -795,7 +875,7 @@ def notemap_connections(
 
         elif operation == "suggest_links":
             if not note_id or note_id not in index:
-                return json.dumps({"error": "valid note_id required"})
+                return safe_json_dumps({"error": "valid note_id required"})
             entry = index[note_id]
             topic_words = set(w.lower() for w in (entry.get("topic") or "").split() if len(w) >= 3)
             note_tags = set(t.lower() for t in (entry.get("tags") or []))
@@ -826,10 +906,10 @@ def notemap_connections(
                     suggestions.append({"id": eid, "score": score, "reasons": reasons, "topic": e.get("topic", "")})
 
             suggestions.sort(key=lambda x: -x["score"])
-            return json.dumps({"note_id": note_id, "suggestions": suggestions[:10]}, indent=2)
+            return safe_json_dumps({"note_id": note_id, "suggestions": suggestions[:10]}, indent=2)
 
         else:
-            return json.dumps({"error": f"Unknown operation: {operation}. Valid: neighborhood, path, suggest_links, suggest_hubs, pagerank, communities, bridges"})
+            return safe_json_dumps({"error": f"Unknown operation: {operation}. Valid: neighborhood, path, suggest_links, suggest_hubs, pagerank, communities, bridges"})
 
     except Exception as exc:
         return _error_response(str(exc), traceback.format_exc())
@@ -839,7 +919,9 @@ def notemap_connections(
 # Tool: notemap_ingest
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={"anthropic/searchHint": "ingest chunk embed text document content semantic search"},
+)
 def notemap_ingest(
     content: str,
     library: str,
@@ -865,7 +947,7 @@ def notemap_ingest(
 
         chunks = chunk_with_sections(content, source_type, source_path, source_title)
         if not chunks:
-            return json.dumps({
+            return safe_json_dumps({
                 "chunks_created": 0,
                 "source": source_path,
                 "library": library,
@@ -888,7 +970,7 @@ def notemap_ingest(
             },
         )
 
-        return json.dumps({
+        return safe_json_dumps({
             "chunks_created": len(chunk_ids),
             "source": source_path,
             "library": library,
@@ -902,7 +984,9 @@ def notemap_ingest(
 # Tool: notemap_embed
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
+@mcp_server.tool(
+    meta={"anthropic/searchHint": "generate refresh embeddings batch vector search"},
+)
 def notemap_embed(
     force: bool = False,
 ) -> str:
@@ -913,7 +997,7 @@ def notemap_embed(
     """
     try:
         if not EMBEDDINGS_AVAILABLE or encode_text is None:
-            return json.dumps({
+            return safe_json_dumps({
                 "embedded": 0,
                 "total_notes": len(get_index()),
                 "model": None,
@@ -952,7 +1036,7 @@ def notemap_embed(
             invalidate_cache()
 
         total_notes = len(index)
-        return json.dumps({
+        return safe_json_dumps({
             "embedded": embedded,
             "total_notes": total_notes,
             "model": MODEL_NAME,

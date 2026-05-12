@@ -78,14 +78,40 @@ def create_note(
     elif len(summary_text.split()) < 5:
         warnings.append("Summary is very short (< 5 words). Consider a more descriptive summary.")
 
-    # Check sources
-    if not params.get("sources"):
-        warnings.append("No sources provided. Note will be unverifiable.")
+    # Note type: warn (don't block) on a value outside the NoteType enum, since
+    # a typo'd type misroutes the note's tier, review interval, and lint behavior.
+    note_type = params.get("type", "knowledge")
+    valid_types = {nt.value for nt in NoteType}
+    if note_type not in valid_types:
+        suggestion = fuzzy_suggestions(note_type, sorted(valid_types))
+        hint = f" Did you mean: {', '.join(suggestion)}?" if suggestion else f" Valid types: {', '.join(sorted(valid_types))}."
+        warnings.append(f"Unknown note type '{note_type}'.{hint}")
+
+    # Source pointer: only nag when the source_quality doesn't already assert that
+    # verification happened. runtime-tested / verified-from-source / user-correction
+    # mean "I checked this" -- the note isn't unverifiable, it just lacks a file/URL
+    # pointer for someone else to re-check later.
+    asserts_verification = {"runtime-tested", "verified-from-source", "user-correction"}
+    if not params.get("sources") and params.get("source_quality") not in asserts_verification:
+        warnings.append(
+            "No source pointer. Add a sources entry so this is traceable later: "
+            "{type:'file', path:..., lines:...} / {type:'url', url:...} / "
+            "{type:'user', context:'verified live this session: ...'}."
+        )
 
     # Check related_functions for relevant types
-    note_type = params.get("type", "knowledge")
     if note_type in ("anti-pattern", "knowledge", "correction") and not params.get("related_functions"):
         warnings.append(f"No related_functions for {note_type} note. Function names are the strongest search signal.")
+
+    # Related notes: warn (don't block) when a link target isn't a known note --
+    # the target may legitimately be created moments later, but a typo'd ID would
+    # otherwise become a silent dangling link.
+    for link in (params.get("related_notes") or []):
+        target_id = link.get("id", "") if isinstance(link, dict) else (link if isinstance(link, str) else "")
+        if target_id and target_id not in index:
+            suggestion = fuzzy_suggestions(target_id, list(index.keys()))
+            hint = f" Did you mean: {', '.join(suggestion)}?" if suggestion else ""
+            warnings.append(f"related_notes target '{target_id}' is not a known note -- link will be dangling.{hint}")
 
     # Check body length
     body_text  = params.get("notes", "").strip()
@@ -94,11 +120,6 @@ def create_note(
         warnings.append(f"Note body is {body_words} words. Consider splitting into atomic notes.")
     if body_words < 10 and body_text:
         warnings.append(f"Note body is very short ({body_words} words). May not provide enough context.")
-
-    # Density notice
-    lib_count = sum(1 for e in index.values() if e.get("library") == library)
-    if lib_count > 30:
-        warnings.append(f"Library '{library}' already has {lib_count} notes. Consider consolidating or splitting into subtopics.")
 
     # Link suggestions
     suggested_links: list[dict[str, Any]] = []
@@ -160,11 +181,14 @@ def create_note(
     is_anti_pattern = note_type == NoteType.ANTI_PATTERN.value
 
     review_intervals: dict[str, int] = {
-        NoteType.ANTI_PATTERN.value: 60,
-        NoteType.TECHNIQUE.value:    90,
-        NoteType.REFERENCE.value:    90,
-        NoteType.DECISION.value:     180,
-        NoteType.FINDING.value:      60,
+        NoteType.ANTI_PATTERN.value:  60,
+        NoteType.TECHNIQUE.value:     90,
+        NoteType.REFERENCE.value:     90,
+        NoteType.DECISION.value:      180,
+        NoteType.FINDING.value:       60,
+        NoteType.COMMUNICATION.value: 120,
+        NoteType.COMMITMENT.value:    30,
+        NoteType.REQUIREMENT.value:   90,
     }
 
     cues_list = params.get("cues", []) or []
@@ -460,6 +484,24 @@ def update_note(
         return {"error": f"Note '{note_id}' not found in database."}
 
     changes: list[str] = []
+    warnings: list[str] = []
+
+    # ---- Note type: warn (don't block) on a value outside the NoteType enum ----
+    if "type" in params:
+        valid_types = {nt.value for nt in NoteType}
+        if params["type"] not in valid_types:
+            suggestion = fuzzy_suggestions(params["type"], sorted(valid_types))
+            hint = f" Did you mean: {', '.join(suggestion)}?" if suggestion else f" Valid: {', '.join(sorted(valid_types))}."
+            warnings.append(f"Unknown note type '{params['type']}'.{hint}")
+
+    # ---- Related notes: warn on link targets that aren't known notes ----
+    if isinstance(params.get("related_notes"), dict):
+        for v in params["related_notes"].get("add", []):
+            target_id = v.get("id", "") if isinstance(v, dict) else (v if isinstance(v, str) else "")
+            if target_id and target_id not in index:
+                suggestion = fuzzy_suggestions(target_id, list(index.keys()))
+                hint = f" Did you mean: {', '.join(suggestion)}?" if suggestion else ""
+                warnings.append(f"related_notes target '{target_id}' is not a known note -- link will be dangling.{hint}")
 
     # ---- Reclassification (library change) ----
     if "new_library" in params:
@@ -469,11 +511,22 @@ def update_note(
             conn.execute("UPDATE notes SET library = ? WHERE id = ?", (new_lib, note_id))
             changes.append(f"library: reclassified from '{old_lib}' to '{new_lib}'")
 
+    # ---- Lifecycle: validate against the Lifecycle enum before accepting ----
+    # Invalid values would silently get written by the simple_fields path, so
+    # we guard explicitly. Valid: active / stale / evergreen / dormant / archived
+    # (see models.Lifecycle).
+    if "lifecycle" in params:
+        valid_lifecycles = {lc.value for lc in Lifecycle}
+        new_lifecycle = params["lifecycle"]
+        if new_lifecycle not in valid_lifecycles:
+            return {"error": f"Invalid lifecycle '{new_lifecycle}'. Valid: {sorted(valid_lifecycles)}"}
+
     # ---- Simple scalar replacements ----
     simple_fields = {
         "type":                  "type",
         "source_quality":        "source_quality",
         "confidence":            "confidence",
+        "lifecycle":             "lifecycle",
         "library_version":       "library_version",
         "review_interval_days":  "review_interval_days",
         "wrong_assumption":      "wrong_assumption",
@@ -655,6 +708,8 @@ def update_note(
             "knowledge": 1.0, "technique": 1.0,
             "convention": 1.2, "reference": 1.2,
             "decision": 1.3, "finding": 1.0,
+            "communication": 1.2, "commitment": 0.8,
+            "requirement": 1.0,
         }.get(note_type, 1.0)
 
         miss_mod = 0.8 ** miss_count if miss_count > 0 else 1.0
@@ -747,11 +802,14 @@ def update_note(
     if entry_data:
         update_entry(index, note_id, entry_data)
 
-    return {
+    result: dict[str, Any] = {
         "id":      note_id,
         "changes": changes,
         "message": f"Updated note '{note_id}' ({len(changes)} change(s))",
     }
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 def delete_note(

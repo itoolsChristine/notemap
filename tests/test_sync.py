@@ -1,11 +1,14 @@
 """Tests for path normalization logic in sync.py."""
 from __future__ import annotations
 
+import re
 import unittest
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
-from sync import apply_substitutions, normalize_paths
+from sync import apply_substitutions, normalize_paths, read_version
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class TestNormalizePaths(unittest.TestCase):
@@ -183,6 +186,34 @@ class TestApplySubstitutions(unittest.TestCase):
         result  = apply_substitutions(content, subs)
         # The regex in apply_substitutions normalizes backslashes in ~/... paths
         self.assertIn("~/libs/", result)
+
+
+class TestVersionSingleSource(unittest.TestCase):
+    """The VERSION file is the single source of truth for the version string.
+
+    sync.py propagates it into src/notemap-mcp/server.py's __version__ literal
+    (and the README badge and CHANGELOG header). This test fails in CI if someone
+    edits one without running sync, catching the drift before release.
+    """
+
+    def _server_version(self) -> str:
+        text = (_REPO_ROOT / "src" / "notemap-mcp" / "server.py").read_text(encoding="utf-8")
+        m = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+        self.assertIsNotNone(m, "server.py has no __version__ literal")
+        return m.group(1)
+
+    def test_version_file_is_semver(self) -> None:
+        """VERSION holds a plain MAJOR.MINOR.PATCH string."""
+        self.assertRegex(read_version(), r'^\d+\.\d+\.\d+$')
+
+    def test_server_version_matches_version_file(self) -> None:
+        """src/notemap-mcp/server.py.__version__ equals the VERSION file (run `python sync.py` if this fails)."""
+        self.assertEqual(self._server_version(), read_version())
+
+    def test_changelog_has_a_section_for_current_version(self) -> None:
+        """CHANGELOG.md has a `## [<VERSION>]` header for the current version."""
+        changelog = (_REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## [{read_version()}]", changelog)
 
 
 if __name__ == "__main__":

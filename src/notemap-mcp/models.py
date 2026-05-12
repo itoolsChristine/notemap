@@ -29,14 +29,17 @@ class Confidence(str, enum.Enum):
 
 
 class NoteType(str, enum.Enum):
-    KNOWLEDGE    = "knowledge"
-    ANTI_PATTERN = "anti-pattern"
-    CORRECTION   = "correction"
-    CONVENTION   = "convention"
-    TECHNIQUE    = "technique"
-    REFERENCE    = "reference"
-    DECISION     = "decision"
-    FINDING      = "finding"
+    KNOWLEDGE     = "knowledge"
+    ANTI_PATTERN  = "anti-pattern"
+    CORRECTION    = "correction"
+    CONVENTION    = "convention"
+    TECHNIQUE     = "technique"
+    REFERENCE     = "reference"
+    DECISION      = "decision"
+    FINDING       = "finding"
+    COMMUNICATION = "communication"
+    COMMITMENT    = "commitment"
+    REQUIREMENT   = "requirement"
 
 
 class Lifecycle(str, enum.Enum):

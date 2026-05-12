@@ -68,12 +68,29 @@ def _read_recent_context(session_id: str, max_messages: int = 5) -> str:
         return ""
 
 
-def format_notes_for_context(results: list[dict], budget: int = 6000) -> str:
-    """Format search results as context for injection."""
-    if not results:
+# Snippet of an ingested chunk's body included in the injected context.
+_CHUNK_SNIPPET_CHARS = 400
+# How many ingested chunks (at most) to append after the notes.
+_MAX_INJECTED_CHUNKS = 3
+
+
+def format_notes_for_context(
+    results: list[dict],
+    budget: int = 6000,
+    chunks: list[dict] | None = None,
+) -> str:
+    """Format search results (and any ingested chunks) as context for injection.
+
+    Notes come first, grouped by library. If *chunks* are given (from a search
+    with include_chunks=True), up to a few are appended under an
+    "## ingested sources" heading -- raw prose from notemap_ingest'd documents.
+    Everything is counted against the same token *budget*; once it's spent, the
+    rest is dropped.
+    """
+    if not results and not chunks:
         return ""
 
-    # Group by library
+    # Group notes by library
     by_library: dict[str, list[dict]] = {}
     for r in results:
         lib = r.get("library", "unknown")
@@ -131,6 +148,28 @@ def format_notes_for_context(results: list[dict], budget: int = 6000) -> str:
             lines.append(entry)
             tokens_used += entry_tokens
 
+    # Ingested chunks (raw prose from notemap_ingest'd documents), if any fit.
+    if chunks:
+        header = "\n## ingested sources"
+        header_tokens = len(header) // 4
+        chunk_lines: list[str] = []
+        for c in chunks[:_MAX_INJECTED_CHUNKS]:
+            title   = c.get("source_title") or c.get("source_path") or "ingested text"
+            section = c.get("section") or ""
+            body    = " ".join((c.get("content") or "").split())
+            if len(body) > _CHUNK_SNIPPET_CHARS:
+                body = body[:_CHUNK_SNIPPET_CHARS].rstrip() + "..."
+            label = f"{title} -- {section}" if section else title
+            entry = f"- **{label}**: {body}"
+            entry_tokens = len(entry) // 4
+            if tokens_used + header_tokens + entry_tokens > budget:
+                break
+            chunk_lines.append(entry)
+            tokens_used += entry_tokens
+        if chunk_lines:
+            lines.append(header)
+            lines.extend(chunk_lines)
+
     if len(lines) <= 1:
         return ""
     return "\n".join(lines)
@@ -180,16 +219,15 @@ def retrieve_for_prompt(
             "query":          search_query[:500],  # Truncate long queries
             "max_results":    10,
             "use_embeddings": True,
+            "include_chunks": True,  # also surface notemap_ingest'd prose
         })
     except Exception:
         return ""
 
     results = result.get("results", [])
-    if not results:
-        return ""
 
-    # Filter by relevance threshold -- RRF scores (0.01-0.05 range) and
-    # reranked relevance scores (0-1 range) are on different scales
+    # Filter notes by relevance threshold -- RRF scores (0.01-0.05 range) and
+    # reranked relevance scores (0-1 range) are on different scales.
     MIN_RRF_SCORE       = 0.015  # Threshold for RRF-scored results
     MIN_RELEVANCE_SCORE = 0.3    # Threshold for reranked 0-1 results
     filtered = []
@@ -200,10 +238,17 @@ def retrieve_for_prompt(
         elif r.get("relevance_score", 0) >= MIN_RELEVANCE_SCORE:
             filtered.append(r)
     results = filtered
-    if not results:
+
+    # Filter ingested chunks by cosine similarity. potion-base-8M cosine is
+    # compressed (~0.65 "same topic", ~0.35 "merely related"); 0.3 keeps the
+    # band that's at least related, no junk.
+    MIN_CHUNK_SCORE = 0.30
+    chunks = [c for c in result.get("chunks", []) if c.get("score", 0.0) >= MIN_CHUNK_SCORE]
+
+    if not results and not chunks:
         return ""
 
-    return format_notes_for_context(results, budget=max_tokens)
+    return format_notes_for_context(results, budget=max_tokens, chunks=chunks)
 
 
 if __name__ == "__main__":

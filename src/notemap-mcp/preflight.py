@@ -107,8 +107,8 @@ def _check_version_compat(note_version_spec: str, project_version: str) -> bool:
 
 # Maps note types to their output tier.
 _TIER_WATCH_OUT = {"anti-pattern", "correction"}
-_TIER_KNOW_THIS = {"knowledge", "technique", "convention"}
-_TIER_REFERENCE = {"reference", "decision", "finding"}
+_TIER_KNOW_THIS = {"knowledge", "technique", "convention", "requirement"}
+_TIER_REFERENCE = {"reference", "decision", "finding", "communication", "commitment"}
 
 # All recognized note types (union of all tiers).
 _ALL_TYPES = _TIER_WATCH_OUT | _TIER_KNOW_THIS | _TIER_REFERENCE

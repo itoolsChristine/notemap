@@ -46,6 +46,9 @@ jobs:
       - name: Run utils tests
         run: python -m unittest tests.test_utils -v
 
+      - name: Run response limit tests
+        run: python -m unittest tests.test_response_limits -v
+
       - name: Run notes helpers tests
         run: python -m unittest tests.test_notes_helpers -v
 

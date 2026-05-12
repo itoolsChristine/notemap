@@ -93,6 +93,22 @@ def _library_matches(note_library: str, filter_library: str) -> bool:
     return note_library.startswith(filter_library + "/")
 
 
+def _lifecycle_excluded(entry_lifecycle: str, filter_lifecycle: str) -> bool:
+    """Return True when a note should be filtered out for the given lifecycle filter.
+
+    "active" surfaces both active and evergreen notes (evergreen = permanently
+    relevant, never goes stale -- preflight already treats it this way, so search
+    must too or evergreen notes vanish from results and from RAG auto-injection).
+    "stale" is exact. Any other filter value disables lifecycle filtering entirely
+    (escape hatch -- e.g. lifecycle="archived" to reach archived notes).
+    """
+    if filter_lifecycle == "active":
+        return entry_lifecycle not in ("active", "evergreen")
+    if filter_lifecycle == "stale":
+        return entry_lifecycle != "stale"
+    return False
+
+
 def _escape_fts5_query(query: str) -> str:
     """Escape special FTS5 characters and build a safe query string.
 
@@ -407,6 +423,18 @@ def search_notes(index: dict[str, dict[str, Any]], params: dict[str, Any]) -> di
     use_embeddings  = bool(params.get("use_embeddings", True))
     include_chunks  = bool(params.get("include_chunks", False))
 
+    # A search with no query and no filters would just dump the whole index --
+    # bounded now, but not what anyone means. Ask for at least one constraint.
+    # (A non-default lifecycle, e.g. "stale"/"archived", counts as a constraint.)
+    has_constraint = bool(query or function_name or tag or note_type or source_quality or confidence or library) or lifecycle != "active"
+    if not has_constraint:
+        return {
+            "count": 0,
+            "results": [],
+            "error": "specify at least one of: query, library, function_name, tag, type, source_quality, confidence",
+            "hint": "use notemap_stats to see what's in the knowledge base, or notemap_preflight to load a library",
+        }
+
     query_lower         = query.lower()
     query_words         = [_normalize_alias(w) for w in query_lower.split()] if query else []
     function_name_lower = function_name.lower()
@@ -481,7 +509,7 @@ def search_notes(index: dict[str, dict[str, Any]], params: dict[str, Any]) -> di
                 continue
             if tag and tag not in (entry.get("tags") or []):
                 continue
-            if lifecycle in ("active", "stale") and entry.get("lifecycle") != lifecycle:
+            if _lifecycle_excluded(entry.get("lifecycle", "active"), lifecycle):
                 continue
 
             # function_name matching
@@ -669,7 +697,7 @@ def search_notes(index: dict[str, dict[str, Any]], params: dict[str, Any]) -> di
                                 continue
                             if tag and tag not in (vec_entry.get("tags") or []):
                                 continue
-                            if lifecycle in ("active", "stale") and vec_entry.get("lifecycle") != lifecycle:
+                            if _lifecycle_excluded(vec_entry.get("lifecycle", "active"), lifecycle):
                                 continue
                             reordered.append({
                                 "id":                     note_id,
@@ -727,7 +755,7 @@ def search_notes(index: dict[str, dict[str, Any]], params: dict[str, Any]) -> di
                 continue
             if tag and tag not in (entry.get("tags") or []):
                 continue
-            if lifecycle in ("active", "stale") and entry.get("lifecycle") != lifecycle:
+            if _lifecycle_excluded(entry.get("lifecycle", "active"), lifecycle):
                 continue
 
             related = entry.get("related_functions") or []
@@ -785,7 +813,7 @@ def search_notes(index: dict[str, dict[str, Any]], params: dict[str, Any]) -> di
                 continue
             if tag and tag not in (entry.get("tags") or []):
                 continue
-            if lifecycle in ("active", "stale") and entry.get("lifecycle") != lifecycle:
+            if _lifecycle_excluded(entry.get("lifecycle", "active"), lifecycle):
                 continue
 
             results.append({
